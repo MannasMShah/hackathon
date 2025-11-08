@@ -127,11 +127,23 @@ def safe_float(value: object) -> float:
 
 
 def storage_gb(row: Dict[str, object]) -> float:
+    estimate = row.get("storage_gb_estimate")
+    try:
+        if estimate is not None:
+            return float(estimate)
+    except (TypeError, ValueError):
+        pass
     size_kb = safe_float(row.get("size_kb"))
     return size_kb / SIZE_KB_PER_GB
 
 
 def estimated_cost(row: Dict[str, object]) -> float:
+    explicit = row.get("estimated_monthly_cost")
+    try:
+        if explicit is not None:
+            return float(explicit)
+    except (TypeError, ValueError):
+        pass
     size_gb = storage_gb(row)
     return size_gb * safe_float(row.get("storage_cost_per_gb"))
 
@@ -236,7 +248,9 @@ except Exception as exc:
 
 df = pd.DataFrame(files_payload)
 if not df.empty:
-    df = df.fillna(0)
+    numeric_cols = df.select_dtypes(include=["number"]).columns
+    if len(numeric_cols) > 0:
+        df.loc[:, numeric_cols] = df.loc[:, numeric_cols].fillna(0)
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +364,21 @@ with datasets_tab:
             "req_count_last_10min",
             "p95_latency_5min",
             "predicted_tier",
+            "prediction_confidence",
         ]
         if "predicted_tier" not in filtered_df.columns:
             filtered_df = filtered_df.assign(predicted_tier="—")
         available_cols = [c for c in display_cols if c in filtered_df.columns]
+        display_df = filtered_df[available_cols].copy()
+        if "size_kb" in display_df.columns:
+            display_df["storage_gb"] = display_df["size_kb"].apply(lambda v: safe_float(v) / SIZE_KB_PER_GB)
+            display_df.drop(columns=["size_kb"], inplace=True)
+        if "prediction_confidence" in display_df.columns:
+            display_df["prediction_confidence"] = display_df["prediction_confidence"].apply(
+                lambda v: f"{safe_float(v) * 100:.1f}%" if v is not None else "—"
+            )
         st.dataframe(
-            filtered_df[available_cols],
+            display_df,
             use_container_width=True,
             hide_index=True,
         )

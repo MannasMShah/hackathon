@@ -35,6 +35,7 @@ STREAM_API_BASE = os.getenv("STREAM_API", "http://stream-api:8001")
 REPLICA_ENDPOINTS = parse_replica_env(os.getenv("REPLICA_ENDPOINTS"))
 SIMULATION_ENABLED = os.getenv("ENABLE_SYNTHETIC_LOAD", "1").lower() not in {"0", "false"}
 SIMULATION_THROTTLE = float(os.getenv("SYNTHETIC_LOAD_INTERVAL", "2.5"))
+SIZE_KB_PER_GB = 1024 * 1024
 
 logger = logging.getLogger("netapp.api")
 
@@ -127,6 +128,7 @@ class SimulationBurst(BaseModel):
 
 # --------- helpers ----------
 FEATURE_DEFAULTS: Dict[str, Any] = {
+    "size_kb": 0.0,
     "req_count_last_1min": 0.0,
     "req_count_last_10min": 0.0,
     "req_count_last_1hr": 0.0,
@@ -153,6 +155,11 @@ FEATURE_DEFAULTS: Dict[str, Any] = {
     "sync_conflicts_last_1hr": 0.0,
     "failed_reads_last_10min": 0.0,
     "network_failures_last_hour": 0.0,
+    "predicted_tier": "unknown",
+    "prediction_confidence": 0.0,
+    "prediction_source": "rule",
+    "storage_gb_estimate": 0.0,
+    "estimated_monthly_cost": 0.0,
 }
 
 LOCATION_TO_TIER = {
@@ -267,6 +274,10 @@ def seed_from_disk():
             {"$set": base_doc},
             upsert=True,
         )
+        try:
+            _update_usage_metrics(m["id"])
+        except Exception:
+            pass
         if consistency_mgr is not None:
             try:
                 consistency_mgr.mark_seed_synced(m["id"])
@@ -577,6 +588,8 @@ def _update_usage_metrics(file_id: str) -> None:
             "cloud_region": 1,
             "latency_sla_ms": 1,
             "access_freq_per_day": 1,
+            "size_kb": 1,
+            "last_access_ts": 1,
         },
     )
 
@@ -622,6 +635,53 @@ def _update_usage_metrics(file_id: str) -> None:
         "network_failures_last_hour": network_failures_last_hour,
         "current_tier": inferred_tier,
     }
+
+    feature_source: Dict[str, Any] = dict(existing or {})
+    feature_source.update(updates)
+    if feature_source.get("size_kb") in (None, ""):
+        feature_source["size_kb"] = FEATURE_DEFAULTS["size_kb"]
+    if feature_source.get("storage_cost_per_gb") in (None, ""):
+        feature_source["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
+
+    predicted_tier: Optional[str] = None
+    prediction_confidence: Optional[float] = None
+    prediction_source = "predictive" if predictor.ready else "rule"
+    try:
+        features = predictor.build_features(feature_source)
+        if predictor.ready:
+            predicted_tier, prediction_confidence = predictor.predict_with_confidence(features)
+            prediction_source = predictor.model_type or "predictive"
+    except Exception as exc:
+        logger.debug("predictive inference failed for %s: %s", file_id, exc)
+
+    if not predicted_tier:
+        predicted_tier = decide_tier(
+            feature_source.get("access_freq_per_day", 0.0),
+            feature_source.get("latency_sla_ms", 9999.0),
+        )
+        if prediction_confidence is None:
+            if predicted_tier == "hot":
+                prediction_confidence = 0.75
+            elif predicted_tier == "warm":
+                prediction_confidence = 0.65
+            else:
+                prediction_confidence = 0.55
+        prediction_source = "rule"
+
+    storage_gb_estimate = float(feature_source.get("size_kb", 0.0)) / SIZE_KB_PER_GB
+    estimated_cost = storage_gb_estimate * float(
+        feature_source.get("storage_cost_per_gb", FEATURE_DEFAULTS["storage_cost_per_gb"])
+    )
+
+    updates.update(
+        {
+            "predicted_tier": predicted_tier,
+            "prediction_confidence": float(prediction_confidence or 0.0),
+            "prediction_source": prediction_source,
+            "storage_gb_estimate": storage_gb_estimate,
+            "estimated_monthly_cost": estimated_cost,
+        }
+    )
 
     if not existing or existing.get("storage_cost_per_gb") is None:
         updates["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
@@ -798,6 +858,7 @@ def train_predictive(payload: TrainPredictivePayload):
 def ingest_event(ev: AccessEvent):
     if coll_files is None:
         raise HTTPException(503, "db not ready")
+    size_increment_kb = float(ev.bytes_written or 0.0) / 1024.0
     if producer is None:
         # still allow policy/metadata pathways to work
         event_doc = {"type": "access", **ev.model_dump()}
@@ -823,15 +884,22 @@ def ingest_event(ev: AccessEvent):
                 payload["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
             if not doc.get("cloud_region") and "cloud_region" not in payload:
                 payload["cloud_region"] = FEATURE_DEFAULTS["cloud_region"]
-            return {"set": payload, "inc": {"access_freq_per_day": 1}}
+            inc_payload = {"access_freq_per_day": 1}
+            if size_increment_kb > 0.0:
+                inc_payload["size_kb"] = size_increment_kb
+            return {"set": payload, "inc": inc_payload}
 
         if consistency_mgr is None:
             coll_files.update_one(
                 {"id": ev.file_id},
                 {
-                    "$inc": {"access_freq_per_day": 1},
+                    "$inc": {
+                        **({"size_kb": size_increment_kb} if size_increment_kb > 0.0 else {}),
+                        "access_freq_per_day": 1,
+                    },
                     "$set": set_updates,
                     "$setOnInsert": {
+                        "size_kb": max(size_increment_kb, FEATURE_DEFAULTS["size_kb"]),
                         "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
                         "cloud_region": FEATURE_DEFAULTS["cloud_region"],
                         "current_tier": FEATURE_DEFAULTS["current_tier"],
@@ -847,9 +915,13 @@ def ingest_event(ev: AccessEvent):
                 coll_files.update_one(
                     {"id": ev.file_id},
                     {
-                        "$inc": {"access_freq_per_day": 1},
+                        "$inc": {
+                            **({"size_kb": size_increment_kb} if size_increment_kb > 0.0 else {}),
+                            "access_freq_per_day": 1,
+                        },
                         "$set": set_updates,
                         "$setOnInsert": {
+                            "size_kb": max(size_increment_kb, FEATURE_DEFAULTS["size_kb"]),
                             "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
                             "cloud_region": FEATURE_DEFAULTS["cloud_region"],
                             "current_tier": FEATURE_DEFAULTS["current_tier"],
@@ -888,15 +960,22 @@ def ingest_event(ev: AccessEvent):
             payload["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
         if not doc.get("cloud_region") and "cloud_region" not in payload:
             payload["cloud_region"] = FEATURE_DEFAULTS["cloud_region"]
-        return {"set": payload, "inc": {"access_freq_per_day": 1}}
+        inc_payload = {"access_freq_per_day": 1}
+        if size_increment_kb > 0.0:
+            inc_payload["size_kb"] = size_increment_kb
+        return {"set": payload, "inc": inc_payload}
 
     if consistency_mgr is None:
         coll_files.update_one(
             {"id": ev.file_id},
             {
-                "$inc": {"access_freq_per_day": 1},
+                "$inc": {
+                    **({"size_kb": size_increment_kb} if size_increment_kb > 0.0 else {}),
+                    "access_freq_per_day": 1,
+                },
                 "$set": set_updates,
                 "$setOnInsert": {
+                    "size_kb": max(size_increment_kb, FEATURE_DEFAULTS["size_kb"]),
                     "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
                     "cloud_region": FEATURE_DEFAULTS["cloud_region"],
                     "current_tier": FEATURE_DEFAULTS["current_tier"],
@@ -909,17 +988,21 @@ def ingest_event(ev: AccessEvent):
         try:
             consistency_mgr.safe_update(ev.file_id, _mutate_success, reason="access_event")
         except Exception:
-            coll_files.update_one(
-                {"id": ev.file_id},
-                {
-                    "$inc": {"access_freq_per_day": 1},
-                    "$set": set_updates,
-                    "$setOnInsert": {
-                        "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
-                        "cloud_region": FEATURE_DEFAULTS["cloud_region"],
-                        "current_tier": FEATURE_DEFAULTS["current_tier"],
-                        "current_location": "s3",
-                    },
+                coll_files.update_one(
+                    {"id": ev.file_id},
+                    {
+                        "$inc": {
+                            **({"size_kb": size_increment_kb} if size_increment_kb > 0.0 else {}),
+                            "access_freq_per_day": 1,
+                        },
+                        "$set": set_updates,
+                        "$setOnInsert": {
+                            "size_kb": max(size_increment_kb, FEATURE_DEFAULTS["size_kb"]),
+                            "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
+                            "cloud_region": FEATURE_DEFAULTS["cloud_region"],
+                            "current_tier": FEATURE_DEFAULTS["current_tier"],
+                            "current_location": "s3",
+                        },
                 },
                 upsert=True,
             )
