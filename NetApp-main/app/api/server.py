@@ -14,13 +14,18 @@ import numpy as np
 
 from orchestrator.rules import decide_tier
 from orchestrator.mover import ensure_buckets, put_seed_objects, move_object
-from orchestrator.consistency import with_retry
+from orchestrator.consistency import (
+    ConsistencyManager,
+    parse_replica_env,
+    with_retry,
+)
 from orchestrator.stream_consumer import ensure_topic
 from orchestrator.predictive import TierPredictor, auto_label_records
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "redpanda:9092")
-TOPIC_ACCESS    = os.getenv("TOPIC_ACCESS", "access-events")
-MONGO_URL       = os.getenv("MONGO_URL", "mongodb://mongo:27017")
+TOPIC_ACCESS = os.getenv("TOPIC_ACCESS", "access-events")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongo:27017")
+REPLICA_ENDPOINTS = parse_replica_env(os.getenv("REPLICA_ENDPOINTS"))
 
 app = FastAPI(title="NetApp Data-in-Motion API")
 
@@ -29,8 +34,10 @@ mongo: Optional[MongoClient] = None
 db = None
 coll_files = None
 coll_events = None
+coll_sync = None
 producer: Optional[KafkaProducer] = None
 predictor: TierPredictor = TierPredictor()
+consistency_mgr: Optional[ConsistencyManager] = None
 
 # --------- models ----------
 class AccessEvent(BaseModel):
@@ -164,11 +171,27 @@ def seed_from_disk():
         )
         for key, default in FEATURE_DEFAULTS.items():
             base_doc.setdefault(key, default)
+        base_doc.setdefault("version", 1)
+        base_doc.setdefault(
+            "sync_state",
+            {
+                "status": "seeded",
+                "last_synced": datetime.now(timezone.utc).isoformat(),
+                "replicas": [],
+                "last_error": None,
+            },
+        )
         coll_files.update_one(
             {"id": m["id"]},
             {"$set": base_doc},
             upsert=True,
         )
+        if consistency_mgr is not None:
+            try:
+                consistency_mgr.mark_seed_synced(m["id"])
+            except Exception:
+                # keep seeding resilient; consistency manager will reconcile later
+                pass
         cnt += 1
     return {"seeded": cnt, "ok": True}
 
@@ -418,7 +441,19 @@ def _update_usage_metrics(file_id: str) -> None:
     if not existing or not existing.get("cloud_region"):
         updates["cloud_region"] = FEATURE_DEFAULTS["cloud_region"]
 
-    coll_files.update_one({"id": file_id}, {"$set": updates}, upsert=True)
+    if consistency_mgr is None:
+        coll_files.update_one({"id": file_id}, {"$set": updates}, upsert=True)
+        return
+
+    try:
+        consistency_mgr.safe_update(
+            file_id,
+            lambda doc, data=updates: {"set": data},
+            reason="metrics_refresh",
+        )
+    except Exception:
+        # fall back to a basic update but keep the API responsive
+        coll_files.update_one({"id": file_id}, {"$set": updates}, upsert=True)
 
 # --------- lifecycle ----------
 @app.on_event("startup")
@@ -426,17 +461,28 @@ def on_startup():
     """
     Robust startup with retries. Keep /health responsive even if deps are warming up.
     """
-    global mongo, db, coll_files, coll_events, producer
+    global mongo, db, coll_files, coll_events, coll_sync, producer, consistency_mgr
 
     # 1) Mongo
     def _mongo():
-        global mongo, db, coll_files, coll_events
+        global mongo, db, coll_files, coll_events, coll_sync
         mongo = MongoClient(MONGO_URL, serverSelectionTimeoutMS=2000)
         _ = mongo.admin.command("ping")
         db = mongo["netapp"]
         coll_files = db["files"]
         coll_events = db["events"]
+        coll_sync = db["sync_queue"]
     with_retry(_mongo, retries=10, backoff=0.5)
+
+    # 1b) Initialize consistency manager once Mongo is ready
+    consistency_mgr = ConsistencyManager(
+        coll_files,
+        coll_events,
+        coll_sync,
+        FEATURE_DEFAULTS,
+        replica_endpoints=REPLICA_ENDPOINTS,
+    )
+    consistency_mgr.ensure_indexes()
 
     # 2) Storage emulators (ensure + seed objects)
     with_retry(ensure_buckets, retries=10, backoff=0.5)
@@ -445,6 +491,12 @@ def on_startup():
     # 3) Seed metadata idempotently (ignore errors)
     try:
         seed_from_disk()
+    except Exception:
+        pass
+
+    # 3b) Reconcile any pending replica sync work
+    try:
+        consistency_mgr.reconcile_pending()
     except Exception:
         pass
 
@@ -535,6 +587,7 @@ def ingest_event(ev: AccessEvent):
         # still allow policy/metadata pathways to work
         event_doc = {"type": "access", **ev.model_dump()}
         event_doc.setdefault("ts", time.time())
+        event_doc["network_failure"] = True
         coll_events.insert_one({**event_doc, "note": "no_stream"})
         set_updates: Dict[str, Any] = {
             "last_access_ts": datetime.fromtimestamp(event_doc["ts"], tz=timezone.utc).isoformat(),
@@ -543,6 +596,86 @@ def ingest_event(ev: AccessEvent):
             set_updates["storage_cost_per_gb"] = float(ev.storage_cost_per_gb)
         if ev.cloud_region:
             set_updates["cloud_region"] = ev.cloud_region
+        if consistency_mgr is not None:
+            try:
+                consistency_mgr.record_failure(ev.file_id, "kafka_unavailable", "producer not ready")
+            except Exception:
+                pass
+
+        def _mutate(doc: Dict[str, Any]):
+            payload = dict(set_updates)
+            if doc.get("storage_cost_per_gb") is None and "storage_cost_per_gb" not in payload:
+                payload["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
+            if not doc.get("cloud_region") and "cloud_region" not in payload:
+                payload["cloud_region"] = FEATURE_DEFAULTS["cloud_region"]
+            return {"set": payload, "inc": {"access_freq_per_day": 1}}
+
+        if consistency_mgr is None:
+            coll_files.update_one(
+                {"id": ev.file_id},
+                {
+                    "$inc": {"access_freq_per_day": 1},
+                    "$set": set_updates,
+                    "$setOnInsert": {
+                        "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
+                        "cloud_region": FEATURE_DEFAULTS["cloud_region"],
+                        "current_tier": FEATURE_DEFAULTS["current_tier"],
+                        "current_location": "s3",
+                    },
+                },
+                upsert=True,
+            )
+        else:
+            try:
+                consistency_mgr.safe_update(ev.file_id, _mutate, reason="access_event")
+            except Exception:
+                coll_files.update_one(
+                    {"id": ev.file_id},
+                    {
+                        "$inc": {"access_freq_per_day": 1},
+                        "$set": set_updates,
+                        "$setOnInsert": {
+                            "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
+                            "cloud_region": FEATURE_DEFAULTS["cloud_region"],
+                            "current_tier": FEATURE_DEFAULTS["current_tier"],
+                            "current_location": "s3",
+                        },
+                    },
+                    upsert=True,
+                )
+        _update_usage_metrics(ev.file_id)
+        return {"queued": False, "note": "streaming backend not ready"}
+    doc = ev.model_dump()
+    try:
+        producer.send(TOPIC_ACCESS, doc)
+        producer.flush(2)
+    except KafkaError as e:
+        if consistency_mgr is not None:
+            try:
+                consistency_mgr.record_failure(ev.file_id, "kafka_error", str(e))
+            except Exception:
+                pass
+        raise HTTPException(503, f"kafka error: {e}")
+    event_doc = {"type": "access", **doc}
+    event_doc.setdefault("ts", time.time())
+    coll_events.insert_one(event_doc)
+    set_updates: Dict[str, Any] = {
+        "last_access_ts": datetime.fromtimestamp(event_doc["ts"], tz=timezone.utc).isoformat(),
+    }
+    if ev.storage_cost_per_gb is not None:
+        set_updates["storage_cost_per_gb"] = float(ev.storage_cost_per_gb)
+    if ev.cloud_region:
+        set_updates["cloud_region"] = ev.cloud_region
+
+    def _mutate_success(doc: Dict[str, Any]):
+        payload = dict(set_updates)
+        if doc.get("storage_cost_per_gb") is None and "storage_cost_per_gb" not in payload:
+            payload["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
+        if not doc.get("cloud_region") and "cloud_region" not in payload:
+            payload["cloud_region"] = FEATURE_DEFAULTS["cloud_region"]
+        return {"set": payload, "inc": {"access_freq_per_day": 1}}
+
+    if consistency_mgr is None:
         coll_files.update_one(
             {"id": ev.file_id},
             {
@@ -557,38 +690,24 @@ def ingest_event(ev: AccessEvent):
             },
             upsert=True,
         )
-        _update_usage_metrics(ev.file_id)
-        return {"queued": False, "note": "streaming backend not ready"}
-    doc = ev.model_dump()
-    try:
-        producer.send(TOPIC_ACCESS, doc)
-        producer.flush(2)
-    except KafkaError as e:
-        raise HTTPException(503, f"kafka error: {e}")
-    event_doc = {"type": "access", **doc}
-    event_doc.setdefault("ts", time.time())
-    coll_events.insert_one(event_doc)
-    set_updates: Dict[str, Any] = {
-        "last_access_ts": datetime.fromtimestamp(event_doc["ts"], tz=timezone.utc).isoformat(),
-    }
-    if ev.storage_cost_per_gb is not None:
-        set_updates["storage_cost_per_gb"] = float(ev.storage_cost_per_gb)
-    if ev.cloud_region:
-        set_updates["cloud_region"] = ev.cloud_region
-    coll_files.update_one(
-        {"id": ev.file_id},
-        {
-            "$inc": {"access_freq_per_day": 1},
-            "$set": set_updates,
-            "$setOnInsert": {
-                "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
-                "cloud_region": FEATURE_DEFAULTS["cloud_region"],
-                "current_tier": FEATURE_DEFAULTS["current_tier"],
-                "current_location": "s3",
-            },
-        },
-        upsert=True,
-    )
+    else:
+        try:
+            consistency_mgr.safe_update(ev.file_id, _mutate_success, reason="access_event")
+        except Exception:
+            coll_files.update_one(
+                {"id": ev.file_id},
+                {
+                    "$inc": {"access_freq_per_day": 1},
+                    "$set": set_updates,
+                    "$setOnInsert": {
+                        "storage_cost_per_gb": FEATURE_DEFAULTS["storage_cost_per_gb"],
+                        "cloud_region": FEATURE_DEFAULTS["cloud_region"],
+                        "current_tier": FEATURE_DEFAULTS["current_tier"],
+                        "current_location": "s3",
+                    },
+                },
+                upsert=True,
+            )
     _update_usage_metrics(ev.file_id)
     return {"queued": True}
 
@@ -609,7 +728,19 @@ def move(req: MoveRequest = Body(...)):
         tier_from_location = LOCATION_TO_TIER.get(req.target.lower())
         if tier_from_location:
             set_fields["current_tier"] = tier_from_location
-        coll_files.update_one({"id": req.file_id}, {"$set": set_fields})
+        if consistency_mgr is None:
+            coll_files.update_one({"id": req.file_id}, {"$set": set_fields})
+        else:
+
+            def _mutate(doc: Dict[str, Any]):
+                payload = dict(set_fields)
+                payload["time_since_last_migration"] = 0.0
+                return {"set": payload, "inc": {"num_recent_migrations": 1}}
+
+            try:
+                consistency_mgr.safe_update(req.file_id, _mutate, reason="migration")
+            except Exception:
+                coll_files.update_one({"id": req.file_id}, {"$set": set_fields})
         coll_events.insert_one(
             {
                 "type": "move",
@@ -626,6 +757,11 @@ def move(req: MoveRequest = Body(...)):
         # return the underlying error so we see exactly what's failing
         err = f"{type(e).__name__}: {e}"
         coll_events.insert_one({"type":"move_error","file_id":req.file_id,"src":src,"target":req.target,"error":err,"ts":time.time()})
+        if consistency_mgr is not None:
+            try:
+                consistency_mgr.record_failure(req.file_id, "move_error", err)
+            except Exception:
+                pass
         raise HTTPException(500, f"move failed {src}->{req.target}: {err}")
 
 @app.post("/seed")
@@ -685,3 +821,21 @@ def storage_test():
         results["gcs"] = {"ok": False, "error": str(e)}
 
     return results
+
+
+@app.get("/consistency/status")
+def consistency_status():
+    if coll_files is None:
+        raise HTTPException(503, "db not ready")
+    if consistency_mgr is None:
+        return {"status": "disabled", "replicas": []}
+    return consistency_mgr.status()
+
+
+@app.post("/consistency/resync")
+def consistency_resync():
+    if coll_files is None:
+        raise HTTPException(503, "db not ready")
+    if consistency_mgr is None:
+        raise HTTPException(503, "consistency manager not ready")
+    return consistency_mgr.reconcile_pending()

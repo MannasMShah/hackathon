@@ -73,3 +73,14 @@ Detect sudden spikes or anomalous patterns that justify immediate moves.
 - Retrain on a cadence aligned with data drift (daily/weekly) and capture model metrics (precision/recall, MAPE) for dashboards.
 - Store model artifacts and metadata for reproducibility, enabling rollback of underperforming versions.
 
+## Consistency & Availability Safeguards
+
+To meet the "Ensure Data Consistency and Availability" requirement the platform now layers distributed-systems guardrails on top of the predictive tiering workflows:
+
+- **Optimistic concurrency with versioning** – every dataset document carries a monotonically increasing `version`. Updates use compare-and-set semantics, retrying automatically when a conflicting write is detected and logging a `sync_conflict` event that also feeds the ML features.
+- **Replica-aware sync manager** – the API boots a `ConsistencyManager` that tracks remote replica endpoints (configurable via `REPLICA_ENDPOINTS`), pushes metadata diffs, and records the outcome in a dedicated `sync_queue` collection. Pending items can be reviewed at `/consistency/status` or replayed with `/consistency/resync`.
+- **Graceful degradation on network failure** – if Kafka, storage, or replica calls fail, the manager captures an `availability_error`, increments reliability features (e.g. `network_failures_last_hour`), and queues the change for later replay instead of dropping it.
+- **Seed-time alignment** – startup seeding stamps every document with a `sync_state` snapshot so new environments begin in a known-good state, and the manager reconciles any unfinished replications as part of bootstrapping.
+
+These enhancements keep tiering recommendations, migrations, and telemetry-derived features aligned across distributed deployments even when the network is unreliable.
+
