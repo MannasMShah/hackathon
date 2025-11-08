@@ -1,0 +1,2 @@
+Synthetic seed content for file_129.txt
+Current tier hint: WARM
