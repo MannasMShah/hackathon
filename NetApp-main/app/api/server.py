@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
@@ -57,7 +57,7 @@ _simulator_event_counter = 0
 class AccessEvent(BaseModel):
     file_id: str
     event: str = "read"      # read/write
-    ts: float = time.time()
+    ts: float = Field(default_factory=lambda: time.time())
     client_id: Optional[str] = None
     bytes_read: Optional[int] = 0
     bytes_written: Optional[int] = 0

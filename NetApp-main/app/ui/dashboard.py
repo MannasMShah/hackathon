@@ -16,7 +16,6 @@ SIZE_KB_PER_GB = 1024 * 1024
 
 st.set_page_config(page_title="NetApp Data-in-Motion", layout="wide")
 st.title("📊 NetApp Data-in-Motion — Mission Control")
-st.markdown("<meta http-equiv='refresh' content='15'>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=5.0)
@@ -59,6 +58,7 @@ def fetch_stream_metrics(limit: int = 240) -> Dict[str, object]:
         "total_events": 0,
         "producer_ready": False,
         "stream_api_online": False,
+        "status": "offline",
     }
 
     try:
@@ -78,6 +78,7 @@ def fetch_stream_metrics(limit: int = 240) -> Dict[str, object]:
             metrics["kafka_bootstrap"] = payload.get("kafka_bootstrap")
             metrics["topic"] = payload.get("topic")
             metrics["reachable"] = True
+            metrics["status"] = "api"
     except Exception:
         pass
 
@@ -102,8 +103,12 @@ def fetch_stream_metrics(limit: int = 240) -> Dict[str, object]:
             metrics["active_devices"] = len({evt.get("device_id") for evt in events if isinstance(evt, dict)})
             metrics["reachable"] = True
             metrics["stream_api_online"] = True
+            metrics["status"] = "stream_api"
     except Exception:
         pass
+
+    if metrics["status"] == "offline" and metrics.get("events"):
+        metrics["status"] = "fallback"
 
     return metrics
 
@@ -258,7 +263,7 @@ with st.container(border=True):
         metrics_row[0].metric("Datasets", total_datasets)
         metrics_row[1].metric("Tier mix", f"🔥 {hot} · 🌤️ {warm} · 🧊 {cold}")
         metrics_row[2].metric("Storage footprint", f"{storage_total:.2f} GB")
-        metrics_row[3].metric("Cost (est/month)", f"₹{est_cost:,.0f}")
+        metrics_row[3].metric("Cost (est/month)", f"₹{est_cost:,.2f}")
         metrics_row[4].metric("Active devices", active_streams)
         metrics_row[5].metric("Kafka throughput", f"{kafka_throughput:.1f} msg/min")
 
@@ -411,7 +416,12 @@ with streaming_tab:
     throughput = float(stream_metrics.get("throughput_per_min", 0.0))
     active_devices = int(stream_metrics.get("active_devices", 0))
     total_events = int(stream_metrics.get("total_events", 0))
-    status_label = "Online" if stream_metrics.get("stream_api_online") else "Offline"
+    status = stream_metrics.get("status", "offline")
+    status_label = {
+        "stream_api": "Online",
+        "api": "Fallback (API proxy)",
+        "fallback": "Offline (using cached events)",
+    }.get(status, "Offline")
 
     metrics_cols = st.columns(5)
     metrics_cols[0].metric("Kafka throughput", f"{throughput:.1f} msg/min")
@@ -419,11 +429,16 @@ with streaming_tab:
     metrics_cols[2].metric("Stream events", total_events)
     producer_status = "Ready" if stream_metrics.get("producer_ready") else "Offline"
     metrics_cols[3].metric("Producer", producer_status)
-    metrics_cols[4].metric("Stream API", status_label)
+    metrics_cols[4].metric("Stream feed", status_label)
     if stream_metrics.get("kafka_bootstrap"):
         st.caption(
             f"Kafka bootstrap: `{stream_metrics.get('kafka_bootstrap')}` · Topic: `{stream_metrics.get('topic', 'access-events')}`"
         )
+
+    if status == "fallback":
+        st.info("Stream API offline — displaying cached events from the control-plane metrics endpoint.")
+    elif status == "offline":
+        st.warning("No streaming data available yet. Trigger the simulator or post events to populate telemetry.")
 
     events = stream_metrics.get("events", []) if stream_metrics else []
     if events:
