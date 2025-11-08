@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import os
+import time
 from collections import Counter
 from typing import Dict, List, Tuple
-
 import pandas as pd
 import requests
 import streamlit as st
 
 
 API = "http://api:8000"
+STREAM_API = os.getenv("STREAM_API", "http://stream-api:8001")
 SIZE_KB_PER_GB = 1024 * 1024
 
 
@@ -44,6 +46,51 @@ def fetch_policy(file_id: str) -> Dict[str, object]:
     if isinstance(payload, dict):
         return payload
     return {"file_id": file_id, "recommendation": "unknown", "source": "n/a", "features": {}}
+
+
+@st.cache_data(ttl=5.0)
+def fetch_stream_metrics(limit: int = 240) -> Dict[str, object]:
+    metrics: Dict[str, object] = {
+        "reachable": False,
+        "throughput_per_min": 0.0,
+        "active_devices": 0,
+        "events": [],
+        "total_events": 0,
+    }
+
+    try:
+        health = requests.get(f"{STREAM_API}/health", timeout=3)
+        health.raise_for_status()
+        payload = health.json()
+        if isinstance(payload, dict):
+            metrics["total_events"] = int(payload.get("events", 0) or 0)
+        metrics["reachable"] = True
+    except Exception:
+        return metrics
+
+    try:
+        resp = requests.get(
+            f"{STREAM_API}/stream/peek",
+            params={"n": limit},
+            timeout=4,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        if isinstance(events, list):
+            metrics["events"] = events
+            now = time.time()
+            recent = [
+                evt for evt in events if isinstance(evt, dict) and now - float(evt.get("timestamp", 0.0) or 0.0) <= 60.0
+            ]
+            if recent:
+                oldest = min(float(evt.get("timestamp", now)) for evt in recent)
+                window = max(now - oldest, 1.0)
+                metrics["throughput_per_min"] = float(len(recent)) * 60.0 / window
+            metrics["active_devices"] = len({evt.get("device_id") for evt in events if isinstance(evt, dict)})
+    except Exception:
+        pass
+
+    return metrics
 
 
 def refresh_all_caches() -> None:
@@ -156,10 +203,16 @@ st.sidebar.caption(
 # Load metadata & derived metrics
 # ---------------------------------------------------------------------------
 files_payload: List[Dict[str, object]] = []
+stream_metrics: Dict[str, object] = {"reachable": False, "throughput_per_min": 0.0, "active_devices": 0, "events": [], "total_events": 0}
 try:
     files_payload = fetch_files_payload()
 except Exception as exc:
     st.error(f"Failed to load metadata from API: {exc}")
+
+try:
+    stream_metrics = fetch_stream_metrics()
+except Exception as exc:
+    st.warning(f"Streaming API unreachable: {exc}")
 
 df = pd.DataFrame(files_payload)
 if not df.empty:
@@ -182,8 +235,8 @@ with st.container(border=True):
         storage_total = sum(storage_gb(rec) for rec in files_payload)
         est_cost = sum(estimated_cost(rec) for rec in files_payload)
         events_series = series_or_zero(df, "events_per_minute")
-        kafka_throughput = float(events_series.sum())
-        active_streams = int((events_series > 0).sum())
+        kafka_throughput = float(stream_metrics.get("throughput_per_min", 0.0))
+        active_streams = int(stream_metrics.get("active_devices", 0))
         migrations_today = int(series_or_zero(df, "num_recent_migrations").sum())
 
         metrics_row = st.columns(6)
@@ -191,7 +244,7 @@ with st.container(border=True):
         metrics_row[1].metric("Tier mix", f"🔥 {hot} · 🌤️ {warm} · 🧊 {cold}")
         metrics_row[2].metric("Storage footprint", f"{storage_total:.2f} GB")
         metrics_row[3].metric("Cost (est/month)", f"₹{est_cost:,.0f}")
-        metrics_row[4].metric("Active streams", active_streams)
+        metrics_row[4].metric("Active devices", active_streams)
         metrics_row[5].metric("Kafka throughput", f"{kafka_throughput:.1f} msg/min")
 
         meta_row = st.columns(2)
@@ -200,6 +253,7 @@ with st.container(border=True):
         with meta_row[1]:
             st.markdown("**Ongoing migrations (24h)**")
             st.metric("Recent moves", migrations_today)
+            st.caption(f"Stream events seen: {int(stream_metrics.get('total_events', 0))}")
 
 
 # ---------------------------------------------------------------------------
@@ -338,35 +392,65 @@ with datasets_tab:
 
 
 with streaming_tab:
-    st.subheader("Streaming Telemetry & Kafka Signals")
-    if df.empty:
-        st.info("No telemetry captured yet. Ingest access events to populate streaming signals.")
+    st.subheader("Streaming Telemetry & Kafka Feed")
+    throughput = float(stream_metrics.get("throughput_per_min", 0.0))
+    active_devices = int(stream_metrics.get("active_devices", 0))
+    total_events = int(stream_metrics.get("total_events", 0))
+    status_label = "Online" if stream_metrics.get("reachable") else "Offline"
+
+    metrics_cols = st.columns(4)
+    metrics_cols[0].metric("Kafka throughput", f"{throughput:.1f} msg/min")
+    metrics_cols[1].metric("Active devices", active_devices)
+    metrics_cols[2].metric("Stream events", total_events)
+    metrics_cols[3].metric("Stream API", status_label)
+
+    events = stream_metrics.get("events", []) if stream_metrics else []
+    if events:
+        events_df = pd.DataFrame(events)
+        if "timestamp" in events_df.columns:
+            events_df["datetime"] = pd.to_datetime(events_df["timestamp"], unit="s", errors="coerce")
+            events_df = events_df.sort_values("datetime")
+            events_df.set_index("datetime", inplace=True)
+
+        chart_cols = st.columns(3)
+        if "temperature" in events_df.columns:
+            chart_cols[0].line_chart(events_df[["temperature"]])
+            chart_cols[0].caption("Sensor temperature stream")
+        if "bytes" in events_df.columns:
+            chart_cols[1].area_chart(events_df[["bytes"]])
+            chart_cols[1].caption("Payload size per event")
+        density_series = events_df.assign(events=1)[["events"]].rolling(window=10, min_periods=1).sum()
+        chart_cols[2].area_chart(density_series)
+        chart_cols[2].caption("Event density (rolling 10)")
+
+        st.markdown("### Live Kafka feed (most recent events)")
+        pretty_cols = [col for col in ["event_id", "device_id", "temperature", "bytes"] if col in events_df.columns]
+        if pretty_cols:
+            st.dataframe(events_df[pretty_cols].tail(50), use_container_width=True)
     else:
-        telemetry_cols = st.columns(3)
-        events_series = series_or_zero(df, "events_per_minute")
-        req_series = series_or_zero(df, "req_count_last_1min")
-        req_10_series = series_or_zero(df, "req_count_last_10min")
-        telemetry_cols[0].metric("Events per minute (total)", f"{events_series.sum():.1f}")
-        telemetry_cols[1].metric("Average req/min", f"{req_series.mean():.1f}")
-        telemetry_cols[2].metric("Consumer lag proxy", f"{(req_10_series.sum() - req_series.sum()):.1f}")
+        st.info("Kafka producer not sending events yet. Start the streaming stack to populate live metrics.")
 
-        st.markdown("**Feature timelines**")
-        chart_cols = [c for c in ["req_count_last_1min", "bytes_read_last_10min", "p95_latency_5min"] if c in df.columns]
-        if chart_cols:
-            st.line_chart(df.set_index("id")[chart_cols])
-        else:
-            st.info("Streaming features not yet available; ingest events to populate charts.")
-
-        st.markdown("**Top streaming datasets**")
-        if "events_per_minute" in df.columns:
-            top_streams = df.sort_values("events_per_minute", ascending=False).head(10)[
-                [col for col in ["id", "events_per_minute", "bytes_read_last_10min", "bytes_written_last_10min", "unique_clients_last_30min"] if col in df.columns]
+    st.markdown("### Metadata-linked feature telemetry")
+    if df.empty:
+        st.info("Dataset metadata will appear once control-plane events are ingested.")
+    else:
+        feature_cols = [
+            col
+            for col in [
+                "req_count_last_1min",
+                "req_count_last_10min",
+                "req_count_last_1hr",
+                "avg_latency_1min",
+                "p95_latency_5min",
+                "ema_req_5min",
+                "ema_req_30min",
             ]
-            st.dataframe(top_streams, use_container_width=True, hide_index=True)
-        else:
-            st.info("Kafka aggregation metrics will appear once events flow through the system.")
+            if col in df.columns
+        ]
+        if feature_cols:
+            st.line_chart(df.set_index("id")[feature_cols])
 
-        st.markdown("**Live signals feed**")
+        st.markdown("**Live feature snapshot**")
         feed_cols = [
             "id",
             "req_count_last_1min",
@@ -376,18 +460,19 @@ with streaming_tab:
             "network_failures_last_hour",
         ]
         feed_cols = [c for c in feed_cols if c in df.columns]
-        feed_df = df[feed_cols].copy()
-        feed_df.rename(
-            columns={
-                "req_count_last_1min": "req/min",
-                "avg_latency_1min": "latency ms",
-                "high_temp_alerts_last_10min": "high-temp (10m)",
-                "failed_reads_last_10min": "failed reads",
-                "network_failures_last_hour": "network failures",
-            },
-            inplace=True,
-        )
-        st.dataframe(feed_df.sort_values("req/min", ascending=False), use_container_width=True, hide_index=True)
+        if feed_cols:
+            feed_df = df[feed_cols].copy()
+            feed_df.rename(
+                columns={
+                    "req_count_last_1min": "req/min",
+                    "avg_latency_1min": "latency ms",
+                    "high_temp_alerts_last_10min": "high-temp (10m)",
+                    "failed_reads_last_10min": "failed reads",
+                    "network_failures_last_hour": "network failures",
+                },
+                inplace=True,
+            )
+            st.dataframe(feed_df.sort_values("req/min", ascending=False), use_container_width=True, hide_index=True)
 
 
 with ml_tab:
@@ -405,8 +490,13 @@ with ml_tab:
         policy_df = pd.DataFrame(policy_rows)
         st.markdown("**Current model outputs**")
         if not policy_df.empty:
-            display = policy_df[["file_id", "recommendation", "source"]]
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            display_cols = ["file_id", "recommendation", "source"]
+            if "confidence" in policy_df.columns:
+                policy_df["confidence_pct"] = policy_df["confidence"].map(lambda v: f"{float(v)*100:.1f}%" if v is not None else "–")
+                display_cols.append("confidence_pct")
+            if "model_type" in policy_df.columns:
+                display_cols.append("model_type")
+            st.dataframe(policy_df[display_cols], use_container_width=True, hide_index=True)
 
         st.markdown("**Feature intensity (per-tier averages)**")
         feature_cols = [

@@ -202,6 +202,38 @@ def _prepare_training_rows(payload: "TrainPredictivePayload"):
     return rows
 
 
+def _bootstrap_predictor_from_rules() -> None:
+    """Train the predictor from existing metadata using the rule engine labels."""
+
+    if coll_files is None:
+        return
+
+    files = list(coll_files.find({}, {"_id": 0}))
+    if not files:
+        return
+
+    rows = auto_label_records(
+        files,
+        lambda doc: decide_tier(
+            doc.get("access_freq_per_day", 0.0),
+            doc.get("latency_sla_ms", 9999.0),
+        ),
+    )
+    if not rows:
+        return
+
+    labels = {
+        row.get(predictor.label_name)
+        for row in rows
+        if row.get(predictor.label_name) is not None
+    }
+    if len(labels) <= 1:
+        # Not enough diversity for a useful model—skip bootstrapping.
+        return
+
+    predictor.train(rows)
+
+
 def _update_usage_metrics(file_id: str) -> None:
     if coll_events is None or coll_files is None:
         return
@@ -423,6 +455,16 @@ def on_startup():
         # Do not fail startup if the local model file is missing or corrupted.
         predictor.model = None
 
+    # 4b) If no persisted model exists yet, bootstrap one from the rule engine so
+    # the predictive path is active out of the box.
+    if not predictor.ready:
+        try:
+            _bootstrap_predictor_from_rules()
+        except Exception:
+            # Keep startup resilient—prediction will fall back to the rule engine
+            # if bootstrapping fails for any reason.
+            pass
+
     # 5) Kafka/Redpanda (best-effort)
     def _producer():
         global producer
@@ -458,12 +500,20 @@ def policy(file_id: str):
         raise HTTPException(404, "file not found")
     features = predictor.build_features(f)
     if predictor.ready:
-        tier = predictor.predict(features)
+        tier, confidence = predictor.predict_with_confidence(features)
         source = "predictive"
     else:
         tier = decide_tier(f.get("access_freq_per_day",0), f.get("latency_sla_ms",9999))
         source = "rule"
-    return {"file_id": file_id, "recommendation": tier, "source": source, "features": features}
+        confidence = None
+    return {
+        "file_id": file_id,
+        "recommendation": tier,
+        "source": source,
+        "features": features,
+        "confidence": confidence,
+        "model_type": getattr(predictor, "model_type", "unknown"),
+    }
 
 
 @app.post("/predictive/train")

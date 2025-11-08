@@ -17,10 +17,73 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
+try:  # pragma: no cover - optional dependency for local dev containers
+    from sklearn.ensemble import HistGradientBoostingClassifier  # type: ignore
+    HAS_SKLEARN = True
+except ModuleNotFoundError:  # pragma: no cover - exercised when sklearn missing
+    HistGradientBoostingClassifier = None  # type: ignore
+    HAS_SKLEARN = False
 
 
 MODEL_PATH = Path("model_store/tier_predictor.pkl")
+
+
+class SimpleCentroidModel:
+    """Lightweight, numpy-only classifier used when scikit-learn is unavailable.
+
+    The implementation keeps per-class feature centroids and predicts the class
+    with the closest Euclidean distance.  It exposes a ``predict`` API that
+    mirrors scikit-learn estimators closely enough for our usage.
+    """
+
+    def __init__(self) -> None:
+        self.classes_: List[str] = []
+        self.centroids_: Dict[str, np.ndarray] = {}
+
+    def fit(self, X: np.ndarray, y: Sequence[str]) -> "SimpleCentroidModel":
+        classes = sorted({*y})
+        if not classes:
+            raise ValueError("no classes provided")
+        self.classes_ = classes
+        for cls in classes:
+            mask = np.array([label == cls for label in y], dtype=bool)
+            if not mask.any():
+                # Should not happen but guard against it.
+                continue
+            self.centroids_[cls] = X[mask].mean(axis=0)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not self.centroids_:
+            raise RuntimeError("centroids not fitted")
+        preds: List[str] = []
+        for row in X:
+            best_cls = None
+            best_dist = float("inf")
+            for cls, centroid in self.centroids_.items():
+                dist = float(np.linalg.norm(row - centroid))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_cls = cls
+            preds.append(best_cls or self.classes_[0])
+        return np.array(preds)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if not self.centroids_:
+            raise RuntimeError("centroids not fitted")
+        probas: List[np.ndarray] = []
+        for row in X:
+            distances: List[float] = []
+            for cls in self.classes_:
+                centroid = self.centroids_.get(cls)
+                if centroid is None:
+                    distances.append(float("inf"))
+                else:
+                    distances.append(float(np.linalg.norm(row - centroid)) + 1e-6)
+            inv = np.array([1.0 / d for d in distances], dtype=float)
+            total = float(inv.sum()) or 1.0
+            probas.append(inv / total)
+        return np.vstack(probas)
 
 
 @dataclass
@@ -66,26 +129,41 @@ class TierPredictor:
             "network_failures_last_hour",
         )
     )
-    model: HistGradientBoostingClassifier | None = None
+    model: object | None = None
     label_name: str = "target_tier"
+    model_type: str = "hist_gradient_boosting"
 
     def load(self, path: Path = MODEL_PATH) -> bool:
         """Load a previously trained model from ``path`` if present."""
         if not path.exists():
             return False
-        with path.open("rb") as fh:
-            payload = pickle.load(fh)
+        try:
+            with path.open("rb") as fh:
+                payload = pickle.load(fh)
+        except (ModuleNotFoundError, AttributeError):
+            # Saved model requires packages that are not installed in the current
+            # environment. Indicate failure so the caller can retrain using the
+            # lightweight fallback implementation.
+            return False
         if not isinstance(payload, dict) or "model" not in payload:
             return False
         self.model = payload["model"]
         self.feature_names = tuple(payload.get("feature_names", self.feature_names))
+        self.model_type = payload.get("model_type", self.model_type)
         return True
 
     def save(self, path: Path = MODEL_PATH) -> None:
         """Persist the trained model and metadata to disk."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("wb") as fh:
-            pickle.dump({"model": self.model, "feature_names": tuple(self.feature_names)}, fh)
+            pickle.dump(
+                {
+                    "model": self.model,
+                    "feature_names": tuple(self.feature_names),
+                    "model_type": self.model_type,
+                },
+                fh,
+            )
 
     @property
     def ready(self) -> bool:
@@ -112,17 +190,24 @@ class TierPredictor:
         if df.empty:
             raise ValueError("training data became empty after dropping NA values")
 
-        X = df.loc[:, self.feature_names].astype(float)
-        y = df[self.label_name].astype(str)
+        X = df.loc[:, self.feature_names].astype(float).to_numpy()
+        y = df[self.label_name].astype(str).to_numpy()
 
-        clf = HistGradientBoostingClassifier(
-            max_depth=3,
-            learning_rate=0.1,
-            max_iter=200,
-            min_samples_leaf=5,
-        )
+        if HAS_SKLEARN and HistGradientBoostingClassifier is not None:
+            clf: object = HistGradientBoostingClassifier(
+                max_depth=3,
+                learning_rate=0.1,
+                max_iter=200,
+                min_samples_leaf=5,
+            )
+            model_type = "hist_gradient_boosting"
+        else:
+            clf = SimpleCentroidModel()
+            model_type = "centroid_classifier"
+
         clf.fit(X, y)
         self.model = clf
+        self.model_type = model_type
         self.save()
 
         # Simple training accuracy metric for visibility.
@@ -133,6 +218,7 @@ class TierPredictor:
             "samples": int(len(df)),
             "classes": sorted({*y}),
             "training_accuracy": round(accuracy, 4),
+            "model_type": model_type,
         }
 
     # ------------------------------------------------------------------
@@ -151,11 +237,38 @@ class TierPredictor:
 
     def predict(self, features: Dict[str, float]) -> str:
         """Predict the tier for the supplied feature dict."""
+        tier, _ = self.predict_with_confidence(features)
+        return tier
+
+    def predict_with_confidence(self, features: Dict[str, float]) -> tuple[str, float]:
+        """Predict the tier and return a (tier, confidence) tuple."""
         if not self.ready:
             raise RuntimeError("predictor has not been trained")
-        ordered = [[features.get(name, 0.0) for name in self.feature_names]]
-        pred = self.model.predict(ordered)
-        return str(pred[0])
+        ordered = np.array([[features.get(name, 0.0) for name in self.feature_names]], dtype=float)
+        model = self.model
+        if model is None:
+            raise RuntimeError("predictor has not been trained")
+
+        pred = model.predict(ordered)
+        label = str(pred[0])
+        confidence = 0.0
+        if hasattr(model, "predict_proba"):
+            try:
+                proba = getattr(model, "predict_proba")(ordered)
+                if isinstance(proba, np.ndarray) and proba.size:
+                    idx = list(getattr(model, "classes_", [])).index(label) if hasattr(model, "classes_") else 0
+                    confidence = float(proba[0][idx])
+            except Exception:
+                confidence = 0.0
+        if confidence <= 0.0:
+            # Fall back to a simple monotonic mapping based on the predicted tier.
+            if label == "hot":
+                confidence = 0.85
+            elif label == "warm":
+                confidence = 0.65
+            else:
+                confidence = 0.55
+        return label, min(max(confidence, 0.0), 1.0)
 
     @staticmethod
     def _days_since_access(last_access_ts: object) -> float:
