@@ -37,6 +37,12 @@ SIMULATION_ENABLED = os.getenv("ENABLE_SYNTHETIC_LOAD", "1").lower() not in {"0"
 SIMULATION_THROTTLE = float(os.getenv("SYNTHETIC_LOAD_INTERVAL", "2.5"))
 SIZE_KB_PER_GB = 1024 * 1024
 
+ALERT_COST_THRESHOLD = float(os.getenv("ALERT_COST_THRESHOLD", "0.08"))
+ALERT_LATENCY_P95_MS = float(os.getenv("ALERT_LATENCY_P95_MS", "180"))
+ALERT_STREAM_RATE = float(os.getenv("ALERT_STREAM_EVENTS_PER_MIN", "15"))
+ALERT_CONFIDENCE_THRESHOLD = float(os.getenv("ALERT_CONFIDENCE_THRESHOLD", "0.9"))
+STREAM_LOW_ACTIVITY_THRESHOLD = float(os.getenv("ALERT_STREAM_LOW_ACTIVITY", "5"))
+
 logger = logging.getLogger("netapp.api")
 
 app = FastAPI(title="NetApp Data-in-Motion API")
@@ -160,6 +166,9 @@ FEATURE_DEFAULTS: Dict[str, Any] = {
     "prediction_source": "rule",
     "storage_gb_estimate": 0.0,
     "estimated_monthly_cost": 0.0,
+    "active_alerts": [],
+    "policy_triggers": [],
+    "last_alert_eval_ts": None,
 }
 
 LOCATION_TO_TIER = {
@@ -167,6 +176,8 @@ LOCATION_TO_TIER = {
     "azure": "hot",
     "gcs": "cold",
 }
+
+TIER_TO_LOCATION = {tier: location for location, tier in LOCATION_TO_TIER.items()}
 
 
 def _stream_event_payload(file_id: str, ev: AccessEvent, counter: int) -> Dict[str, Any]:
@@ -226,6 +237,292 @@ def _build_stream_snapshot(limit: int = 240) -> Dict[str, Any]:
         snapshot["active_clients"] = len(clients)
     return snapshot
 
+
+def _alert_signature(alert: Dict[str, Any]) -> tuple:
+    if not isinstance(alert, dict):
+        return ()
+    return (
+        str(alert.get("type") or ""),
+        str(alert.get("reason") or ""),
+        str(alert.get("severity") or ""),
+    )
+
+
+def _policy_signature(policy: Dict[str, Any]) -> tuple:
+    if not isinstance(policy, dict):
+        return ()
+    return (
+        str(policy.get("action") or ""),
+        str(policy.get("target_tier") or ""),
+        str(policy.get("reason") or ""),
+    )
+
+
+def _evaluate_alerts(
+    existing_alerts: Optional[List[Dict[str, Any]]],
+    existing_policies: Optional[List[Dict[str, Any]]],
+    feature_source: Dict[str, Any],
+    predicted_tier: Optional[str],
+    prediction_confidence: Optional[float],
+    inferred_tier: str,
+    estimated_cost: float,
+) -> Dict[str, List[Dict[str, Any]]]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    current_tier = (inferred_tier or "unknown").lower()
+    predicted_tier_normalised = (predicted_tier or "").lower()
+    confidence = float(prediction_confidence or 0.0)
+
+    events_per_minute = float(feature_source.get("events_per_minute", 0.0) or 0.0)
+    p95_latency = float(feature_source.get("p95_latency_5min", 0.0) or 0.0)
+    avg_latency = float(feature_source.get("avg_latency_1min", 0.0) or 0.0)
+    cost_estimate = float(estimated_cost)
+
+    previous_alerts = {
+        _alert_signature(alert): alert
+        for alert in (existing_alerts or [])
+        if isinstance(alert, dict)
+    }
+    previous_policies = {
+        _policy_signature(policy): policy
+        for policy in (existing_policies or [])
+        if isinstance(policy, dict)
+    }
+
+    alerts: List[Dict[str, Any]] = []
+    policies: List[Dict[str, Any]] = []
+
+    def _carry_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
+        alert.setdefault("triggered_at", now_iso)
+        sig = _alert_signature(alert)
+        if sig in previous_alerts:
+            alert.setdefault("triggered_at", previous_alerts[sig].get("triggered_at", now_iso))
+        return alert
+
+    def _carry_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+        policy.setdefault("triggered_at", now_iso)
+        sig = _policy_signature(policy)
+        if sig in previous_policies:
+            existing = previous_policies[sig]
+            policy.setdefault("triggered_at", existing.get("triggered_at", now_iso))
+            if policy.get("confidence") in (None, 0.0):
+                policy["confidence"] = existing.get("confidence")
+        return policy
+
+    # Latency breach alert → promote to hot tier
+    if p95_latency >= ALERT_LATENCY_P95_MS:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "latency_sla",
+                    "severity": "critical",
+                    "reason": "latency_sla_breach",
+                    "message": (
+                        f"p95 latency {p95_latency:.1f} ms exceeded SLA ({ALERT_LATENCY_P95_MS:.0f} ms)"
+                    ),
+                    "metric": {
+                        "p95_latency_5min": p95_latency,
+                        "avg_latency_1min": avg_latency,
+                    },
+                }
+            )
+        )
+        if current_tier != "hot":
+            target_tier = "hot"
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "latency_remediation",
+                        "action": "promote_tier",
+                        "target_tier": target_tier,
+                        "target_location": TIER_TO_LOCATION.get(target_tier),
+                        "reason": "latency_sla_breach",
+                        "confidence": max(confidence, 0.95 if predicted_tier_normalised == "hot" else 0.85),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    # Streaming hotspot alert → consider promoting tier
+    if events_per_minute >= ALERT_STREAM_RATE:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "stream_hotspot",
+                    "severity": "warning",
+                    "reason": "stream_hotspot",
+                    "message": f"Kafka throughput {events_per_minute:.1f} events/min crosses {ALERT_STREAM_RATE}",
+                    "metric": {"events_per_minute": events_per_minute},
+                }
+            )
+        )
+        if current_tier != "hot":
+            target_tier = "hot" if predicted_tier_normalised == "hot" else "warm"
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "stream_hotspot",
+                        "action": "promote_tier",
+                        "target_tier": target_tier,
+                        "target_location": TIER_TO_LOCATION.get(target_tier),
+                        "reason": "stream_hotspot",
+                        "confidence": max(confidence, 0.9 if target_tier == "hot" else 0.8),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    # Cost alert when spend is high but usage is low → demote tier
+    if cost_estimate >= ALERT_COST_THRESHOLD and events_per_minute <= STREAM_LOW_ACTIVITY_THRESHOLD:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "cost_overrun",
+                    "severity": "warning",
+                    "reason": "cost_efficiency",
+                    "message": (
+                        f"Estimated monthly cost ₹{cost_estimate:.2f} with low activity ({events_per_minute:.1f}/min)"
+                    ),
+                    "metric": {
+                        "estimated_monthly_cost": cost_estimate,
+                        "events_per_minute": events_per_minute,
+                    },
+                }
+            )
+        )
+        if current_tier not in {"cold"}:
+            target_tier = "cold"
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "cost_optimisation",
+                        "action": "demote_tier",
+                        "target_tier": target_tier,
+                        "target_location": TIER_TO_LOCATION.get(target_tier),
+                        "reason": "cost_efficiency",
+                        "confidence": max(confidence, 0.75),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    # High-confidence ML recommendation → actionable policy trigger
+    if (
+        predicted_tier_normalised
+        and predicted_tier_normalised != current_tier
+        and confidence >= ALERT_CONFIDENCE_THRESHOLD
+    ):
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "ml_recommendation",
+                    "severity": "info",
+                    "reason": "ml_high_confidence",
+                    "message": (
+                        f"Predictive model suggests {predicted_tier_normalised.upper()} with {confidence * 100:.1f}% confidence"
+                    ),
+                    "metric": {
+                        "prediction_confidence": confidence,
+                        "predicted_tier": predicted_tier_normalised,
+                    },
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "ml_recommendation",
+                    "action": "apply_prediction",
+                    "target_tier": predicted_tier_normalised,
+                    "target_location": TIER_TO_LOCATION.get(predicted_tier_normalised),
+                    "reason": "ml_high_confidence",
+                    "confidence": confidence,
+                    "status": "pending",
+                }
+            )
+        )
+
+    return {"alerts": alerts, "policies": policies}
+
+
+def _record_alert_events(
+    file_id: str,
+    previous_alerts: Optional[List[Dict[str, Any]]],
+    new_alerts: Optional[List[Dict[str, Any]]],
+    previous_policies: Optional[List[Dict[str, Any]]],
+    new_policies: Optional[List[Dict[str, Any]]],
+) -> None:
+    if coll_events is None:
+        return
+
+    now = time.time()
+
+    prev_alert_map = {
+        _alert_signature(alert): alert
+        for alert in (previous_alerts or [])
+        if isinstance(alert, dict)
+    }
+    new_alert_map = {
+        _alert_signature(alert): alert
+        for alert in (new_alerts or [])
+        if isinstance(alert, dict)
+    }
+
+    for signature, alert in new_alert_map.items():
+        if signature not in prev_alert_map:
+            coll_events.insert_one(
+                {
+                    "type": "alert",
+                    "file_id": file_id,
+                    "ts": now,
+                    **alert,
+                }
+            )
+
+    for signature, alert in prev_alert_map.items():
+        if signature not in new_alert_map:
+            coll_events.insert_one(
+                {
+                    "type": "alert_resolved",
+                    "file_id": file_id,
+                    "ts": now,
+                    "alert_type": alert.get("type"),
+                    "reason": alert.get("reason"),
+                }
+            )
+
+    prev_policy_map = {
+        _policy_signature(policy): policy
+        for policy in (previous_policies or [])
+        if isinstance(policy, dict)
+    }
+    new_policy_map = {
+        _policy_signature(policy): policy
+        for policy in (new_policies or [])
+        if isinstance(policy, dict)
+    }
+
+    for signature, policy in new_policy_map.items():
+        if signature not in prev_policy_map:
+            coll_events.insert_one(
+                {
+                    "type": "policy_triggered",
+                    "file_id": file_id,
+                    "ts": now,
+                    **policy,
+                }
+            )
+
+    for signature, policy in prev_policy_map.items():
+        if signature not in new_policy_map:
+            coll_events.insert_one(
+                {
+                    "type": "policy_cleared",
+                    "file_id": file_id,
+                    "ts": now,
+                    "action": policy.get("action"),
+                    "reason": policy.get("reason"),
+                }
+            )
 
 def seed_from_disk():
     """Load /data/seeds/metadata.json into Mongo and ensure objects are in S3."""
@@ -682,6 +979,35 @@ def _update_usage_metrics(file_id: str) -> None:
             "estimated_monthly_cost": estimated_cost,
         }
     )
+
+    previous_alerts = list(existing.get("active_alerts", [])) if existing else []
+    previous_policies = list(existing.get("policy_triggers", [])) if existing else []
+    evaluation = _evaluate_alerts(
+        previous_alerts,
+        previous_policies,
+        feature_source,
+        predicted_tier,
+        prediction_confidence,
+        inferred_tier,
+        estimated_cost,
+    )
+    alerts = evaluation.get("alerts", [])
+    policies = evaluation.get("policies", [])
+
+    updates["active_alerts"] = alerts
+    updates["policy_triggers"] = policies
+    updates["last_alert_eval_ts"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        _record_alert_events(
+            file_id,
+            previous_alerts,
+            alerts,
+            previous_policies,
+            policies,
+        )
+    except Exception as exc:
+        logger.debug("failed to record alert history for %s: %s", file_id, exc)
 
     if not existing or existing.get("storage_cost_per_gb") is None:
         updates["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]

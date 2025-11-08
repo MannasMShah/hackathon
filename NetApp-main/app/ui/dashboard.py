@@ -174,33 +174,86 @@ def summarise_alerts(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     if df.empty:
         return warnings, infos
 
+    seen_warnings: set = set()
+    seen_infos: set = set()
+
     latency_series = series_or_zero(df, "p95_latency_5min")
     hot_latency = df[latency_series > 150]
     for _, row in hot_latency.iterrows():
-        warnings.append(
-            f"Latency spike — {row['id']} p95 latency {row.get('p95_latency_5min', 0):.1f} ms"
-        )
+        msg = f"Latency spike — {row['id']} p95 latency {row.get('p95_latency_5min', 0):.1f} ms"
+        if msg not in seen_warnings:
+            warnings.append(msg)
+            seen_warnings.add(msg)
 
     high_temp_series = series_or_zero(df, "high_temp_alerts_last_10min")
     high_temp = df[high_temp_series > 0]
     for _, row in high_temp.iterrows():
-        warnings.append(
+        msg = (
             f"Sensor alert — {row['id']} reported {int(row.get('high_temp_alerts_last_10min', 0))} high-temp events"
         )
+        if msg not in seen_warnings:
+            warnings.append(msg)
+            seen_warnings.add(msg)
 
     failed_reads_series = series_or_zero(df, "failed_reads_last_10min")
     failed_reads = df[failed_reads_series > 0]
     for _, row in failed_reads.iterrows():
-        warnings.append(
-            f"Read failures — {row['id']} saw {int(row.get('failed_reads_last_10min', 0))} errors"
-        )
+        msg = f"Read failures — {row['id']} saw {int(row.get('failed_reads_last_10min', 0))} errors"
+        if msg not in seen_warnings:
+            warnings.append(msg)
+            seen_warnings.add(msg)
 
     if "events_per_minute" in df.columns:
         top_streams = df.sort_values("events_per_minute", ascending=False).head(3)
         for _, row in top_streams.iterrows():
             rate = safe_float(row.get("events_per_minute"))
             if rate > 0:
-                infos.append(f"Kafka hot path — {row['id']} running {rate:.1f} events/min")
+                msg = f"Kafka hot path — {row['id']} running {rate:.1f} events/min"
+                if msg not in seen_infos:
+                    infos.append(msg)
+                    seen_infos.add(msg)
+
+    if "active_alerts" in df.columns:
+        for _, row in df.iterrows():
+            alerts = row.get("active_alerts") or []
+            for alert in alerts:
+                if not isinstance(alert, dict):
+                    continue
+                message = alert.get("message") or alert.get("reason")
+                if not message:
+                    continue
+                severity = str(alert.get("severity") or "info").lower()
+                prefix = "⚠️" if severity in {"critical", "warning"} else "ℹ️"
+                formatted = f"{prefix} {row['id']}: {message}"
+                if severity in {"critical", "warning"}:
+                    if formatted not in seen_warnings:
+                        warnings.append(formatted)
+                        seen_warnings.add(formatted)
+                else:
+                    if formatted not in seen_infos:
+                        infos.append(formatted)
+                        seen_infos.add(formatted)
+
+    if "policy_triggers" in df.columns:
+        for _, row in df.iterrows():
+            policies = row.get("policy_triggers") or []
+            for policy in policies:
+                if not isinstance(policy, dict):
+                    continue
+                message = policy.get("reason") or policy.get("action")
+                if not message:
+                    continue
+                action = policy.get("action") or "policy"
+                confidence = policy.get("confidence")
+                suffix = (
+                    f" (confidence {float(confidence) * 100:.1f}%)"
+                    if confidence not in (None, "")
+                    else ""
+                )
+                formatted = f"ℹ️ {row['id']}: {action} — {message}{suffix}"
+                if formatted not in seen_infos:
+                    infos.append(formatted)
+                    seen_infos.add(formatted)
 
     return warnings, infos
 
@@ -273,6 +326,16 @@ with st.container(border=True):
         kafka_throughput = float(stream_metrics.get("throughput_per_min", 0.0))
         active_streams = int(stream_metrics.get("active_devices", 0))
         migrations_today = int(series_or_zero(df, "num_recent_migrations").sum())
+        total_alerts = sum(
+            len(record.get("active_alerts") or [])
+            for record in files_payload
+            if isinstance(record, dict)
+        )
+        total_policy_triggers = sum(
+            len(record.get("policy_triggers") or [])
+            for record in files_payload
+            if isinstance(record, dict)
+        )
 
         metrics_row = st.columns(6)
         metrics_row[0].metric("Datasets", total_datasets)
@@ -288,6 +351,9 @@ with st.container(border=True):
         with meta_row[1]:
             st.markdown("**Ongoing migrations (24h)**")
             st.metric("Recent moves", migrations_today)
+            signal_cols = st.columns(2)
+            signal_cols[0].metric("Active alerts", total_alerts)
+            signal_cols[1].metric("Policy triggers", total_policy_triggers)
             st.caption(f"Stream events seen: {int(stream_metrics.get('total_events', 0))}")
         st.caption("Tier defaults: Azure = HOT, S3 = WARM, GCS = COLD. Confidence ≥95% triggers eligible bulk moves.")
 
@@ -445,6 +511,46 @@ with datasets_tab:
             cols[1].metric("EMA (30m)", f"{safe_float(selected_row.get('ema_req_30min')):.1f}")
             cols[2].metric("Events/min", f"{safe_float(selected_row.get('events_per_minute')):.1f}")
             cols[3].metric("High-temp alerts", int(safe_float(selected_row.get('high_temp_alerts_last_10min'))))
+
+        alerts_block = selected_row.get("active_alerts") or []
+        policies_block = selected_row.get("policy_triggers") or []
+        with st.container(border=True):
+            st.markdown("**Automated alerts**")
+            if alerts_block:
+                for alert in alerts_block:
+                    if not isinstance(alert, dict):
+                        continue
+                    message = alert.get("message") or alert.get("reason") or "Alert triggered"
+                    severity = str(alert.get("severity") or "info").lower()
+                    timestamp = alert.get("triggered_at")
+                    suffix = f" · since {timestamp}" if timestamp else ""
+                    if severity in {"critical", "warning"}:
+                        st.warning(f"{message}{suffix}")
+                    else:
+                        st.info(f"{message}{suffix}")
+            else:
+                st.caption("No automated alerts for this dataset.")
+
+            st.markdown("**Policy triggers**")
+            if policies_block:
+                for policy in policies_block:
+                    if not isinstance(policy, dict):
+                        continue
+                    action = policy.get("action") or "policy"
+                    reason = policy.get("reason") or "auto"
+                    confidence = policy.get("confidence")
+                    target = policy.get("target_tier") or "—"
+                    target_location = policy.get("target_location") or "—"
+                    confidence_label = (
+                        f"confidence {float(confidence) * 100:.1f}%"
+                        if confidence not in (None, "")
+                        else "confidence n/a"
+                    )
+                    st.info(
+                        f"{action} → {target.upper()} ({target_location}) — {reason} ({confidence_label})"
+                    )
+            else:
+                st.caption("No automated policy triggers for this dataset.")
 
         action_cols = st.columns([1, 1, 1, 1])
         if action_cols[0].button("🔁 Simulate Access", key=f"simulate-{dataset_id}"):
@@ -665,6 +771,36 @@ with migrations_tab:
         st.markdown("**Migration trend proxy**")
         trend_df = migration_df[["id", "minutes since last move", "migrations (24h)"]].set_index("id")
         st.area_chart(trend_df)
+
+        policy_rows: List[Dict[str, object]] = []
+        for record in files_payload:
+            if not isinstance(record, dict):
+                continue
+            dataset = record.get("id")
+            for policy in record.get("policy_triggers") or []:
+                if not isinstance(policy, dict):
+                    continue
+                policy_rows.append(
+                    {
+                        "dataset": dataset,
+                        "action": policy.get("action"),
+                        "target_tier": policy.get("target_tier"),
+                        "target_location": policy.get("target_location"),
+                        "reason": policy.get("reason"),
+                        "confidence": policy.get("confidence"),
+                    }
+                )
+
+        st.markdown("**Automated policy triggers**")
+        if policy_rows:
+            policy_df = pd.DataFrame(policy_rows)
+            if "confidence" in policy_df.columns:
+                policy_df["confidence"] = policy_df["confidence"].map(
+                    lambda v: f"{float(v) * 100:.1f}%" if v not in (None, "") else "—"
+                )
+            st.dataframe(policy_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No active automated triggers right now.")
 
         warning_msgs, info_msgs = summarise_alerts(df)
         st.markdown("**Active alerts**")
