@@ -500,12 +500,20 @@ def policy(file_id: str):
         raise HTTPException(404, "file not found")
     features = predictor.build_features(f)
     if predictor.ready:
-        tier = predictor.predict(features)
+        tier, confidence = predictor.predict_with_confidence(features)
         source = "predictive"
     else:
         tier = decide_tier(f.get("access_freq_per_day",0), f.get("latency_sla_ms",9999))
         source = "rule"
-    return {"file_id": file_id, "recommendation": tier, "source": source, "features": features}
+        confidence = None
+    return {
+        "file_id": file_id,
+        "recommendation": tier,
+        "source": source,
+        "features": features,
+        "confidence": confidence,
+        "model_type": getattr(predictor, "model_type", "unknown"),
+    }
 
 
 @app.post("/predictive/train")

@@ -490,8 +490,13 @@ with ml_tab:
         policy_df = pd.DataFrame(policy_rows)
         st.markdown("**Current model outputs**")
         if not policy_df.empty:
-            display = policy_df[["file_id", "recommendation", "source"]]
-            st.dataframe(display, use_container_width=True, hide_index=True)
+            display_cols = ["file_id", "recommendation", "source"]
+            if "confidence" in policy_df.columns:
+                policy_df["confidence_pct"] = policy_df["confidence"].map(lambda v: f"{float(v)*100:.1f}%" if v is not None else "–")
+                display_cols.append("confidence_pct")
+            if "model_type" in policy_df.columns:
+                display_cols.append("model_type")
+            st.dataframe(policy_df[display_cols], use_container_width=True, hide_index=True)
 
         st.markdown("**Feature intensity (per-tier averages)**")
         feature_cols = [
