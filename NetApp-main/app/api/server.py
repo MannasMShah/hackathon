@@ -4,6 +4,7 @@ import os
 import random
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean
@@ -42,6 +43,19 @@ ALERT_LATENCY_P95_MS = float(os.getenv("ALERT_LATENCY_P95_MS", "180"))
 ALERT_STREAM_RATE = float(os.getenv("ALERT_STREAM_EVENTS_PER_MIN", "15"))
 ALERT_CONFIDENCE_THRESHOLD = float(os.getenv("ALERT_CONFIDENCE_THRESHOLD", "0.9"))
 STREAM_LOW_ACTIVITY_THRESHOLD = float(os.getenv("ALERT_STREAM_LOW_ACTIVITY", "5"))
+ALERT_EGRESS_COST_SPIKE = float(os.getenv("ALERT_EGRESS_COST_SPIKE", "50"))
+ALERT_CROSS_CLOUD_EGRESS_COUNT = float(os.getenv("ALERT_CROSS_CLOUD_EGRESS_COUNT", "30"))
+ALERT_COST_ANOMALY_MULTIPLIER = float(os.getenv("ALERT_COST_ANOMALY_MULTIPLIER", "1.8"))
+ALERT_LATENCY_MAX_MS = float(os.getenv("ALERT_LATENCY_MAX_MS", "400"))
+ALERT_LATENCY_DELTA_MS = float(os.getenv("ALERT_LATENCY_DELTA_MS", "120"))
+ALERT_BURST_RATIO = float(os.getenv("ALERT_BURST_RATIO", "1.5"))
+ALERT_GROWTH_RATE_SPIKE = float(os.getenv("ALERT_GROWTH_RATE_SPIKE", "120"))
+ALERT_GROWTH_RATE_DROP = float(os.getenv("ALERT_GROWTH_RATE_DROP", "80"))
+ALERT_TEMP_ALERT_COUNT = float(os.getenv("ALERT_TEMP_ALERT_COUNT", "3"))
+ALERT_UNIQUE_CLIENT_SURGE_RATIO = float(os.getenv("ALERT_UNIQUE_CLIENT_SURGE_RATIO", "1.5"))
+ALERT_WRITE_RATIO_THRESHOLD = float(os.getenv("ALERT_WRITE_RATIO_THRESHOLD", "0.7"))
+ALERT_MOVE_FAILURE_THRESHOLD = float(os.getenv("ALERT_MOVE_FAILURE_THRESHOLD", "2"))
+ALERT_COOLING_EMA_THRESHOLD = float(os.getenv("ALERT_COOLING_EMA_THRESHOLD", "4"))
 
 logger = logging.getLogger("netapp.api")
 
@@ -66,12 +80,14 @@ class AccessEvent(BaseModel):
     event: str = "read"      # read/write
     ts: float = Field(default_factory=lambda: time.time())
     client_id: Optional[str] = None
+    client_region: Optional[str] = None
     bytes_read: Optional[int] = 0
     bytes_written: Optional[int] = 0
     latency_ms: Optional[float] = None
     temperature: Optional[float] = None
     high_temp_alert: bool = False
     egress_cost: Optional[float] = 0.0
+    egress_cloud: Optional[str] = None
     storage_cost_per_gb: Optional[float] = None
     cloud_region: Optional[str] = None
     sync_conflict: bool = False
@@ -157,6 +173,14 @@ FEATURE_DEFAULTS: Dict[str, Any] = {
     "time_since_last_migration": 1e6,
     "storage_cost_per_gb": 0.05,
     "egress_cost_last_1hr": 0.0,
+    "egress_to_s3_last_1hr": 0.0,
+    "egress_to_azure_last_1hr": 0.0,
+    "egress_to_gcs_last_1hr": 0.0,
+    "write_ratio_last_10min": 0.0,
+    "burst_score_10min": 0.0,
+    "burst_ratio_last_minute": 0.0,
+    "client_region_diversity_last_30min": 0.0,
+    "recent_move_failures": 0.0,
     "cloud_region": "us-east-1",
     "sync_conflicts_last_1hr": 0.0,
     "failed_reads_last_10min": 0.0,
@@ -266,6 +290,7 @@ def _evaluate_alerts(
     prediction_confidence: Optional[float],
     inferred_tier: str,
     estimated_cost: float,
+    existing_doc: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     now_iso = datetime.now(timezone.utc).isoformat()
     current_tier = (inferred_tier or "unknown").lower()
@@ -276,6 +301,30 @@ def _evaluate_alerts(
     p95_latency = float(feature_source.get("p95_latency_5min", 0.0) or 0.0)
     avg_latency = float(feature_source.get("avg_latency_1min", 0.0) or 0.0)
     cost_estimate = float(estimated_cost)
+    egress_cost_last_1hr = float(feature_source.get("egress_cost_last_1hr", 0.0) or 0.0)
+    max_latency = float(feature_source.get("max_latency_10min", 0.0) or 0.0)
+    growth_rate = float(feature_source.get("growth_rate_10min", 0.0) or 0.0)
+    delta_latency = float(feature_source.get("delta_latency_5min", 0.0) or 0.0)
+    write_ratio = float(feature_source.get("write_ratio_last_10min", 0.0) or 0.0)
+    burst_score = float(feature_source.get("burst_score_10min", 0.0) or 0.0)
+    burst_ratio = float(feature_source.get("burst_ratio_last_minute", 0.0) or 0.0)
+    client_diversity = float(feature_source.get("client_region_diversity_last_30min", 0.0) or 0.0)
+    recent_move_failures = float(feature_source.get("recent_move_failures", 0.0) or 0.0)
+    unique_clients = float(feature_source.get("unique_clients_last_30min", 0.0) or 0.0)
+    req_count_last_10min = float(feature_source.get("req_count_last_10min", 0.0) or 0.0)
+    ema_req_30 = float(feature_source.get("ema_req_30min", 0.0) or 0.0)
+    egress_to_s3 = float(feature_source.get("egress_to_s3_last_1hr", 0.0) or 0.0)
+    egress_to_azure = float(feature_source.get("egress_to_azure_last_1hr", 0.0) or 0.0)
+    egress_to_gcs = float(feature_source.get("egress_to_gcs_last_1hr", 0.0) or 0.0)
+
+    previous_doc = existing_doc or {}
+    prev_cost = float(previous_doc.get("estimated_monthly_cost") or 0.0)
+    prev_unique_clients = float(previous_doc.get("unique_clients_last_30min") or 0.0)
+    prev_events_per_minute = float(previous_doc.get("events_per_minute") or 0.0)
+    prev_req_count_10 = float(previous_doc.get("req_count_last_10min") or 0.0)
+    prev_write_ratio = float(previous_doc.get("write_ratio_last_10min") or 0.0)
+    prev_burst_ratio = float(previous_doc.get("burst_ratio_last_minute") or 0.0)
+    prev_temp_alerts = float(previous_doc.get("high_temp_alerts_last_10min") or 0.0)
 
     previous_alerts = {
         _alert_signature(alert): alert
@@ -339,6 +388,64 @@ def _evaluate_alerts(
                         "confidence": max(confidence, 0.95 if predicted_tier_normalised == "hot" else 0.85),
                         "status": "pending",
                     }
+            )
+        )
+
+    if max_latency >= ALERT_LATENCY_MAX_MS:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "latency_peak",
+                    "severity": "critical",
+                    "reason": "max_latency_spike",
+                    "message": (
+                        f"Max latency {max_latency:.1f} ms breached {ALERT_LATENCY_MAX_MS:.0f} ms"
+                    ),
+                    "metric": {"max_latency_10min": max_latency},
+                }
+            )
+        )
+        if current_tier != "hot":
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "latency_peak",
+                        "action": "promote_tier",
+                        "target_tier": "hot",
+                        "target_location": TIER_TO_LOCATION.get("hot"),
+                        "reason": "max_latency_spike",
+                        "confidence": max(confidence, 0.9),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    if delta_latency >= ALERT_LATENCY_DELTA_MS:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "latency_trend",
+                    "severity": "warning",
+                    "reason": "latency_delta_spike",
+                    "message": (
+                        f"Latency increased by {delta_latency:.1f} ms over last 5 minutes"
+                    ),
+                    "metric": {"delta_latency_5min": delta_latency},
+                }
+            )
+        )
+        if current_tier != "hot":
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "latency_trend",
+                        "action": "promote_tier",
+                        "target_tier": "hot",
+                        "target_location": TIER_TO_LOCATION.get("hot"),
+                        "reason": "latency_delta_spike",
+                        "confidence": max(confidence, 0.88),
+                        "status": "pending",
+                    }
                 )
             )
 
@@ -370,6 +477,341 @@ def _evaluate_alerts(
                     }
                 )
             )
+
+    egress_breakdown = {
+        "azure": egress_to_azure,
+        "s3": egress_to_s3,
+        "gcs": egress_to_gcs,
+    }
+    dominant_egress_cloud = None
+    dominant_egress_value = 0.0
+    if any(val > 0.0 for val in egress_breakdown.values()):
+        dominant_egress_cloud, dominant_egress_value = max(
+            egress_breakdown.items(), key=lambda item: item[1]
+        )
+
+    if egress_cost_last_1hr >= ALERT_EGRESS_COST_SPIKE:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "egress_cost_spike",
+                    "severity": "warning",
+                    "reason": "egress_cost_spike",
+                    "message": (
+                        f"Egress spend ₹{egress_cost_last_1hr:.2f} in last hour exceeds ₹{ALERT_EGRESS_COST_SPIKE:.2f}"
+                    ),
+                    "metric": {"egress_cost_last_1hr": egress_cost_last_1hr},
+                }
+            )
+        )
+        if current_tier not in {"cold"}:
+            target_tier = (
+                predicted_tier_normalised
+                if predicted_tier_normalised in {"warm", "cold"}
+                else "warm"
+            )
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "egress_cost_spike",
+                        "action": "optimize_cost",
+                        "target_tier": target_tier,
+                        "target_location": TIER_TO_LOCATION.get(target_tier),
+                        "reason": "egress_cost_spike",
+                        "confidence": max(confidence, 0.82),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    if dominant_egress_cloud and dominant_egress_value >= ALERT_CROSS_CLOUD_EGRESS_COUNT:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "cross_cloud_egress",
+                    "severity": "warning",
+                    "reason": "cross_cloud_traffic",
+                    "message": (
+                        f"{dominant_egress_value:.0f} egress events targeting {dominant_egress_cloud.upper()}"
+                    ),
+                    "metric": {
+                        "egress_events": dominant_egress_value,
+                        "target_cloud": dominant_egress_cloud,
+                    },
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "cross_cloud_alignment",
+                    "action": "replicate_near_clients",
+                    "target_tier": LOCATION_TO_TIER.get(dominant_egress_cloud, current_tier),
+                    "target_location": dominant_egress_cloud,
+                    "reason": "cross_cloud_traffic",
+                    "confidence": max(confidence, 0.78),
+                    "status": "pending",
+                }
+            )
+        )
+
+    if prev_cost > 0.0 and cost_estimate >= prev_cost * ALERT_COST_ANOMALY_MULTIPLIER:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "cost_anomaly",
+                    "severity": "warning",
+                    "reason": "cost_jump",
+                    "message": (
+                        f"Estimated cost jumped from ₹{prev_cost:.2f} to ₹{cost_estimate:.2f}"
+                    ),
+                    "metric": {
+                        "previous_cost": prev_cost,
+                        "current_cost": cost_estimate,
+                    },
+                }
+            )
+        )
+        if current_tier not in {"cold"}:
+            target_tier = (
+                predicted_tier_normalised
+                if predicted_tier_normalised in {"warm", "cold"}
+                else "cold"
+            )
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "cost_anomaly",
+                        "action": "demote_tier",
+                        "target_tier": target_tier,
+                        "target_location": TIER_TO_LOCATION.get(target_tier),
+                        "reason": "cost_jump",
+                        "confidence": max(confidence, 0.8),
+                        "status": "pending",
+                    }
+            )
+        )
+
+    if burst_ratio >= ALERT_BURST_RATIO and burst_ratio > max(prev_burst_ratio, 0.0):
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "stream_burst",
+                    "severity": "warning",
+                    "reason": "burst_ratio_spike",
+                    "message": (
+                        f"Per-minute throughput surged {burst_ratio:.2f}x over baseline"
+                    ),
+                    "metric": {
+                        "burst_ratio_last_minute": burst_ratio,
+                        "burst_score_10min": burst_score,
+                    },
+                }
+            )
+        )
+        target_tier = "hot" if predicted_tier_normalised == "hot" else "warm"
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "stream_burst",
+                    "action": "promote_tier",
+                    "target_tier": target_tier,
+                    "target_location": TIER_TO_LOCATION.get(target_tier),
+                    "reason": "burst_ratio_spike",
+                    "confidence": max(confidence, 0.86 if target_tier == "hot" else 0.8),
+                    "status": "pending",
+                }
+            )
+        )
+
+    if growth_rate >= ALERT_GROWTH_RATE_SPIKE and req_count_last_10min > prev_req_count_10:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "access_surge",
+                    "severity": "warning",
+                    "reason": "growth_rate_spike",
+                    "message": (
+                        f"10-minute request volume jumped by {growth_rate:.0f} ops"
+                    ),
+                    "metric": {"growth_rate_10min": growth_rate},
+                }
+            )
+        )
+        if current_tier != "hot":
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "access_surge",
+                        "action": "promote_tier",
+                        "target_tier": "hot",
+                        "target_location": TIER_TO_LOCATION.get("hot"),
+                        "reason": "growth_rate_spike",
+                        "confidence": max(confidence, 0.87),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    if (
+        prev_unique_clients > 0.0
+        and unique_clients >= prev_unique_clients * ALERT_UNIQUE_CLIENT_SURGE_RATIO
+    ):
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "client_surge",
+                    "severity": "info",
+                    "reason": "unique_clients_spike",
+                    "message": (
+                        f"Unique clients jumped from {prev_unique_clients:.0f} to {unique_clients:.0f}"
+                    ),
+                    "metric": {
+                        "previous_unique_clients": prev_unique_clients,
+                        "unique_clients_last_30min": unique_clients,
+                        "client_region_diversity_last_30min": client_diversity,
+                    },
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "client_surge",
+                    "action": "replicate_near_clients",
+                    "target_tier": LOCATION_TO_TIER.get(dominant_egress_cloud, current_tier)
+                    if dominant_egress_cloud
+                    else current_tier,
+                    "target_location": dominant_egress_cloud if dominant_egress_cloud else None,
+                    "reason": "unique_clients_spike",
+                    "confidence": max(confidence, 0.75),
+                    "status": "pending",
+                }
+            )
+        )
+
+    if (
+        high_temp_alerts_last_10min >= ALERT_TEMP_ALERT_COUNT
+        and high_temp_alerts_last_10min > prev_temp_alerts
+    ):
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "temperature_anomaly",
+                    "severity": "warning",
+                    "reason": "temperature_spike",
+                    "message": (
+                        f"{high_temp_alerts_last_10min:.0f} high-temp alerts fired in 10 minutes"
+                    ),
+                    "metric": {"high_temp_alerts_last_10min": high_temp_alerts_last_10min},
+                }
+            )
+        )
+        if current_tier != "hot":
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "temperature_anomaly",
+                        "action": "promote_tier",
+                        "target_tier": "hot",
+                        "target_location": TIER_TO_LOCATION.get("hot"),
+                        "reason": "temperature_spike",
+                        "confidence": max(confidence, 0.84),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    if write_ratio >= ALERT_WRITE_RATIO_THRESHOLD and write_ratio > prev_write_ratio:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "write_heavy_shift",
+                    "severity": "info",
+                    "reason": "write_ratio_increase",
+                    "message": (
+                        f"Writes now {write_ratio:.0%} of operations in last 10 minutes"
+                    ),
+                    "metric": {"write_ratio_last_10min": write_ratio},
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "write_heavy_shift",
+                    "action": "promote_tier",
+                    "target_tier": "hot",
+                    "target_location": TIER_TO_LOCATION.get("hot"),
+                    "reason": "write_ratio_increase",
+                    "confidence": max(confidence, 0.83),
+                    "status": "pending",
+                }
+            )
+        )
+
+    if (
+        growth_rate <= -ALERT_GROWTH_RATE_DROP
+        and ema_req_30 <= ALERT_COOLING_EMA_THRESHOLD
+        and events_per_minute <= STREAM_LOW_ACTIVITY_THRESHOLD
+    ):
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "cooling_trend",
+                    "severity": "info",
+                    "reason": "cooling_pattern",
+                    "message": "Workload cooling detected; usage trending down",
+                    "metric": {
+                        "growth_rate_10min": growth_rate,
+                        "ema_req_30min": ema_req_30,
+                    },
+                }
+            )
+        )
+        if current_tier not in {"cold"}:
+            target_tier = "cold" if predicted_tier_normalised == "cold" else "warm"
+            policies.append(
+                _carry_policy(
+                    {
+                        "type": "cooling_trend",
+                        "action": "demote_tier",
+                        "target_tier": target_tier,
+                        "target_location": TIER_TO_LOCATION.get(target_tier),
+                        "reason": "cooling_pattern",
+                        "confidence": max(confidence, 0.8),
+                        "status": "pending",
+                    }
+                )
+            )
+
+    if recent_move_failures >= ALERT_MOVE_FAILURE_THRESHOLD:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "migration_failure",
+                    "severity": "warning",
+                    "reason": "migration_failures",
+                    "message": (
+                        f"{recent_move_failures:.0f} migration failures recorded in last hour"
+                    ),
+                    "metric": {"recent_move_failures": recent_move_failures},
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "migration_failure",
+                    "action": "hold_migrations",
+                    "target_tier": current_tier,
+                    "target_location": TIER_TO_LOCATION.get(current_tier),
+                    "reason": "migration_failures",
+                    "confidence": 0.7,
+                    "status": "pending",
+                }
+            )
+        )
 
     # Cost alert when spend is high but usage is low → demote tier
     if cost_estimate >= ALERT_COST_THRESHOLD and events_per_minute <= STREAM_LOW_ACTIVITY_THRESHOLD:
@@ -546,14 +988,19 @@ def seed_from_disk():
 
     cnt = 0
     for m in meta:
-        base_doc = {
-            **m,
-            "current_location": "s3",
-        }
-        base_doc.setdefault(
-            "current_tier",
-            LOCATION_TO_TIER.get(base_doc["current_location"], FEATURE_DEFAULTS["current_tier"]),
-        )
+        base_doc = dict(m)
+        loc_value = str(base_doc.get("current_location") or "").lower()
+        tier_value = str(base_doc.get("current_tier") or "").lower()
+        if loc_value not in LOCATION_TO_TIER:
+            if tier_value in TIER_TO_LOCATION:
+                loc_value = TIER_TO_LOCATION[tier_value] or "s3"
+            else:
+                loc_value = random.choice(list(LOCATION_TO_TIER.keys()))
+        base_doc["current_location"] = loc_value
+        if not tier_value or tier_value == "unknown":
+            base_doc["current_tier"] = LOCATION_TO_TIER.get(
+                loc_value, FEATURE_DEFAULTS["current_tier"]
+            )
         for key, default in FEATURE_DEFAULTS.items():
             base_doc.setdefault(key, default)
         base_doc.setdefault("version", 1)
@@ -629,12 +1076,23 @@ def _simulate_load_loop():
                     event=event_type,
                     ts=time.time(),
                     client_id=f"svc-{rng.randint(1, 200)}",
+                    client_region=rng.choice(
+                        ["us-east-1", "eu-west-1", "ap-south-1", "us-west-2"]
+                    ),
                     bytes_read=base_bytes if event_type == "read" else 0,
                     bytes_written=base_bytes if event_type == "write" else 0,
                     latency_ms=latency,
                     temperature=rng.uniform(45.0, 95.0),
                     high_temp_alert=rng.random() < 0.05,
                     egress_cost=rng.uniform(0.0, 0.75),
+                    egress_cloud=rng.choice(
+                        [
+                            loc
+                            for loc in LOCATION_TO_TIER.keys()
+                            if loc != record.get("current_location")
+                        ]
+                        or list(LOCATION_TO_TIER.keys())
+                    ),
                     storage_cost_per_gb=record.get("storage_cost_per_gb", 0.05),
                     cloud_region=record.get("cloud_region", "us-east-1"),
                     sync_conflict=rng.random() < 0.02,
@@ -853,6 +1311,38 @@ def _update_usage_metrics(file_id: str) -> None:
     sync_conflicts_last_1hr = _count_flag(last_hour, "sync_conflict")
     failed_reads_last_10min = _count_flag(last_10, "failed_read")
     network_failures_last_hour = _count_flag(last_hour, "network_failure")
+    egress_targets = Counter(
+        str(e.get("egress_cloud", "")).lower() for e in last_hour if e.get("egress_cloud")
+    )
+    egress_to_s3_last_1hr = float(egress_targets.get("s3", 0.0))
+    egress_to_azure_last_1hr = float(egress_targets.get("azure", 0.0))
+    egress_to_gcs_last_1hr = float(egress_targets.get("gcs", 0.0))
+    writes_last_10 = [e for e in last_10 if str(e.get("event", "")).lower() == "write"]
+    total_last_10 = float(len(last_10))
+    write_ratio_last_10min = float(len(writes_last_10)) / total_last_10 if total_last_10 else 0.0
+    prev_10_count = float(len(prev_10))
+    burst_score_10min = req_count_last_10min / max(prev_10_count, 1.0)
+    prev_minute_rate = float(len(prev_5)) / 5.0 if prev_5 else 0.0
+    burst_ratio_last_minute = (
+        req_count_last_1min / max(prev_minute_rate, 1.0)
+        if prev_minute_rate
+        else req_count_last_1min
+    )
+    client_regions = {
+        str(e.get("client_region", "")).lower()
+        for e in last_30
+        if e.get("client_region")
+    }
+    client_region_diversity = float(len(client_regions))
+    recent_move_failures = float(
+        coll_events.count_documents(
+            {
+                "type": "move_error",
+                "file_id": file_id,
+                "ts": {"$gte": now - 3600.0},
+            }
+        )
+    )
 
     moves = list(
         coll_events.find(
@@ -927,6 +1417,14 @@ def _update_usage_metrics(file_id: str) -> None:
         "num_recent_migrations": num_recent_migrations,
         "time_since_last_migration": time_since_last_migration,
         "egress_cost_last_1hr": egress_cost_last_1hr,
+        "egress_to_s3_last_1hr": egress_to_s3_last_1hr,
+        "egress_to_azure_last_1hr": egress_to_azure_last_1hr,
+        "egress_to_gcs_last_1hr": egress_to_gcs_last_1hr,
+        "write_ratio_last_10min": write_ratio_last_10min,
+        "burst_score_10min": burst_score_10min,
+        "burst_ratio_last_minute": burst_ratio_last_minute,
+        "client_region_diversity_last_30min": client_region_diversity,
+        "recent_move_failures": recent_move_failures,
         "sync_conflicts_last_1hr": sync_conflicts_last_1hr,
         "failed_reads_last_10min": failed_reads_last_10min,
         "network_failures_last_hour": network_failures_last_hour,
@@ -990,6 +1488,7 @@ def _update_usage_metrics(file_id: str) -> None:
         prediction_confidence,
         inferred_tier,
         estimated_cost,
+        existing,
     )
     alerts = evaluation.get("alerts", [])
     policies = evaluation.get("policies", [])
@@ -1434,12 +1933,21 @@ def simulate_burst(payload: SimulationBurst):
             event=event_type,
             ts=time.time(),
             client_id=f"burst-{rng.randint(1, 400)}",
+            client_region=rng.choice(["us-east-1", "eu-west-1", "ap-south-1", "us-west-2"]),
             bytes_read=base_bytes if event_type == "read" else 0,
             bytes_written=base_bytes if event_type == "write" else 0,
             latency_ms=rng.uniform(12.0, 220.0),
             temperature=rng.uniform(50.0, 98.0),
             high_temp_alert=rng.random() < 0.08,
             egress_cost=rng.uniform(0.0, 1.0),
+            egress_cloud=rng.choice(
+                [
+                    loc
+                    for loc in LOCATION_TO_TIER.keys()
+                    if loc != record.get("current_location")
+                ]
+                or list(LOCATION_TO_TIER.keys())
+            ),
             storage_cost_per_gb=record.get("storage_cost_per_gb", 0.05),
             cloud_region=record.get("cloud_region", "us-east-1"),
             sync_conflict=rng.random() < 0.03,
