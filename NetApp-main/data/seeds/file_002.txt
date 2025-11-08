@@ -1,1 +1,2 @@
-﻿Hello from file_002 (warm candidate)
+Synthetic seed content for file_002.txt
+Current tier hint: HOT
