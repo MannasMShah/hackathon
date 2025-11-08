@@ -1,0 +1,2 @@
+Synthetic seed content for file_014.txt
+Current tier hint: COLD
