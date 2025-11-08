@@ -125,6 +125,12 @@ FEATURE_DEFAULTS: Dict[str, Any] = {
     "network_failures_last_hour": 0.0,
 }
 
+LOCATION_TO_TIER = {
+    "s3": "warm",
+    "azure": "hot",
+    "gcs": "cold",
+}
+
 
 def seed_from_disk():
     """Load /data/seeds/metadata.json into Mongo and ensure objects are in S3."""
@@ -152,6 +158,10 @@ def seed_from_disk():
             **m,
             "current_location": "s3",
         }
+        base_doc.setdefault(
+            "current_tier",
+            LOCATION_TO_TIER.get(base_doc["current_location"], FEATURE_DEFAULTS["current_tier"]),
+        )
         for key, default in FEATURE_DEFAULTS.items():
             base_doc.setdefault(key, default)
         coll_files.update_one(
@@ -315,6 +325,35 @@ def _update_usage_metrics(file_id: str) -> None:
     else:
         time_since_last_migration = FEATURE_DEFAULTS["time_since_last_migration"]
 
+    existing = coll_files.find_one(
+        {"id": file_id},
+        {
+            "_id": 0,
+            "current_tier": 1,
+            "current_location": 1,
+            "storage_cost_per_gb": 1,
+            "cloud_region": 1,
+            "latency_sla_ms": 1,
+            "access_freq_per_day": 1,
+        },
+    )
+
+    inferred_tier = None
+    if existing:
+        tier_value = existing.get("current_tier")
+        if isinstance(tier_value, str) and tier_value.lower() != "unknown":
+            inferred_tier = tier_value
+        else:
+            loc = str(existing.get("current_location", "")).lower()
+            inferred_tier = LOCATION_TO_TIER.get(loc)
+        if not inferred_tier:
+            inferred_tier = decide_tier(
+                existing.get("access_freq_per_day", 0.0),
+                existing.get("latency_sla_ms", 9999.0),
+            )
+    if not inferred_tier:
+        inferred_tier = FEATURE_DEFAULTS["current_tier"]
+
     updates = {
         "req_count_last_1min": req_count_last_1min,
         "req_count_last_10min": req_count_last_10min,
@@ -339,7 +378,14 @@ def _update_usage_metrics(file_id: str) -> None:
         "sync_conflicts_last_1hr": sync_conflicts_last_1hr,
         "failed_reads_last_10min": failed_reads_last_10min,
         "network_failures_last_hour": network_failures_last_hour,
+        "current_tier": inferred_tier,
     }
+
+    if not existing or existing.get("storage_cost_per_gb") is None:
+        updates["storage_cost_per_gb"] = FEATURE_DEFAULTS["storage_cost_per_gb"]
+    if not existing or not existing.get("cloud_region"):
+        updates["cloud_region"] = FEATURE_DEFAULTS["cloud_region"]
+
     coll_files.update_one({"id": file_id}, {"$set": updates}, upsert=True)
 
 # --------- lifecycle ----------
@@ -509,8 +555,21 @@ def move(req: MoveRequest = Body(...)):
     src = f.get("current_location", "s3")
     try:
         with_retry(lambda: move_object(req.file_id, src, req.target))
-        coll_files.update_one({"id": req.file_id}, {"$set": {"current_location": req.target}})
-        coll_events.insert_one({"type":"move","file_id":req.file_id,"src":src,"target":req.target,"ts":time.time()})
+        set_fields: Dict[str, Any] = {"current_location": req.target}
+        tier_from_location = LOCATION_TO_TIER.get(req.target.lower())
+        if tier_from_location:
+            set_fields["current_tier"] = tier_from_location
+        coll_files.update_one({"id": req.file_id}, {"$set": set_fields})
+        coll_events.insert_one(
+            {
+                "type": "move",
+                "file_id": req.file_id,
+                "src": src,
+                "target": req.target,
+                "tier": set_fields.get("current_tier"),
+                "ts": time.time(),
+            }
+        )
         _update_usage_metrics(req.file_id)
         return {"moved": True, "from": src, "to": req.target}
     except Exception as e:
