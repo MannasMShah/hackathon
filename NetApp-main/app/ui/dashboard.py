@@ -39,6 +39,19 @@ def fetch_health() -> Dict[str, object]:
     return {"status": "unknown"}
 
 
+@st.cache_data(ttl=10.0)
+def fetch_global_policy_state() -> Dict[str, object]:
+    response = requests.get(f"{API}/policy/global", timeout=5)
+    response.raise_for_status()
+    payload = response.json()
+    if isinstance(payload, dict):
+        payload.setdefault("alerts", [])
+        payload.setdefault("policy_triggers", [])
+        payload.setdefault("totals", {})
+        return payload
+    return {"alerts": [], "policy_triggers": [], "totals": {}}
+
+
 @st.cache_data(ttl=15.0)
 def fetch_policy(file_id: str) -> Dict[str, object]:
     response = requests.get(f"{API}/policy/{file_id}", timeout=5)
@@ -118,6 +131,7 @@ def refresh_all_caches() -> None:
     fetch_files_payload.clear()
     fetch_health.clear()
     fetch_policy.clear()
+    fetch_global_policy_state.clear()
 
 
 def safe_float(value: object) -> float:
@@ -234,27 +248,6 @@ def summarise_alerts(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
                         infos.append(formatted)
                         seen_infos.add(formatted)
 
-    if "policy_triggers" in df.columns:
-        for _, row in df.iterrows():
-            policies = row.get("policy_triggers") or []
-            for policy in policies:
-                if not isinstance(policy, dict):
-                    continue
-                message = policy.get("reason") or policy.get("action")
-                if not message:
-                    continue
-                action = policy.get("action") or "policy"
-                confidence = policy.get("confidence")
-                suffix = (
-                    f" (confidence {float(confidence) * 100:.1f}%)"
-                    if confidence not in (None, "")
-                    else ""
-                )
-                formatted = f"ℹ️ {row['id']}: {action} — {message}{suffix}"
-                if formatted not in seen_infos:
-                    infos.append(formatted)
-                    seen_infos.add(formatted)
-
     return warnings, infos
 
 
@@ -300,6 +293,12 @@ try:
 except Exception as exc:
     st.warning(f"Streaming API unreachable: {exc}")
 
+global_policy_state: Dict[str, object] = {"alerts": [], "policy_triggers": [], "totals": {}}
+try:
+    global_policy_state = fetch_global_policy_state()
+except Exception as exc:
+    st.warning(f"Global policy state unavailable: {exc}")
+
 df = pd.DataFrame(files_payload)
 if not df.empty:
     numeric_cols = df.select_dtypes(include=["number"]).columns
@@ -322,20 +321,20 @@ with st.container(border=True):
         cold = tier_counts.get("cold", 0)
         storage_total = sum(storage_gb(rec) for rec in files_payload)
         est_cost = sum(estimated_cost(rec) for rec in files_payload)
-        events_series = series_or_zero(df, "events_per_minute")
         kafka_throughput = float(stream_metrics.get("throughput_per_min", 0.0))
         active_streams = int(stream_metrics.get("active_devices", 0))
         migrations_today = int(series_or_zero(df, "num_recent_migrations").sum())
+        global_totals = global_policy_state.get("totals", {}) or {}
+        storage_total = max(storage_total, safe_float(global_totals.get("storage_gb_total")))
+        est_cost = max(est_cost, safe_float(global_totals.get("estimated_monthly_cost")))
+        kafka_throughput = max(kafka_throughput, safe_float(global_totals.get("total_events_per_minute")))
         total_alerts = sum(
             len(record.get("active_alerts") or [])
             for record in files_payload
             if isinstance(record, dict)
         )
-        total_policy_triggers = sum(
-            len(record.get("policy_triggers") or [])
-            for record in files_payload
-            if isinstance(record, dict)
-        )
+        global_policy_triggers = len(global_policy_state.get("policy_triggers") or [])
+        global_alert_count = len(global_policy_state.get("alerts") or [])
 
         metrics_row = st.columns(6)
         metrics_row[0].metric("Datasets", total_datasets)
@@ -352,9 +351,11 @@ with st.container(border=True):
             st.markdown("**Ongoing migrations (24h)**")
             st.metric("Recent moves", migrations_today)
             signal_cols = st.columns(2)
-            signal_cols[0].metric("Active alerts", total_alerts)
-            signal_cols[1].metric("Policy triggers", total_policy_triggers)
-            st.caption(f"Stream events seen: {int(stream_metrics.get('total_events', 0))}")
+            signal_cols[0].metric("Dataset alerts", total_alerts)
+            signal_cols[1].metric("Database policy triggers", global_policy_triggers)
+            st.caption(
+                f"Global alerts: {global_alert_count} · Stream events seen: {int(stream_metrics.get('total_events', 0))}"
+            )
         st.caption("Tier defaults: Azure = HOT, S3 = WARM, GCS = COLD. Confidence ≥95% triggers eligible bulk moves.")
 
 
@@ -513,7 +514,7 @@ with datasets_tab:
             cols[3].metric("High-temp alerts", int(safe_float(selected_row.get('high_temp_alerts_last_10min'))))
 
         alerts_block = selected_row.get("active_alerts") or []
-        policies_block = selected_row.get("policy_triggers") or []
+        global_policies = global_policy_state.get("policy_triggers") or []
         with st.container(border=True):
             st.markdown("**Automated alerts**")
             if alerts_block:
@@ -531,26 +532,27 @@ with datasets_tab:
             else:
                 st.caption("No automated alerts for this dataset.")
 
-            st.markdown("**Policy triggers**")
-            if policies_block:
-                for policy in policies_block:
+            st.markdown("**Database policy triggers**")
+            if global_policies:
+                for policy in global_policies:
                     if not isinstance(policy, dict):
                         continue
                     action = policy.get("action") or "policy"
                     reason = policy.get("reason") or "auto"
                     confidence = policy.get("confidence")
-                    target = policy.get("target_tier") or "—"
-                    target_location = policy.get("target_location") or "—"
                     confidence_label = (
                         f"confidence {float(confidence) * 100:.1f}%"
                         if confidence not in (None, "")
                         else "confidence n/a"
                     )
-                    st.info(
-                        f"{action} → {target.upper()} ({target_location}) — {reason} ({confidence_label})"
+                    metric = policy.get("metric") or {}
+                    metric_hint = ", ".join(
+                        f"{key}={value}" for key, value in metric.items() if key and value is not None
                     )
+                    suffix = f" ({metric_hint})" if metric_hint else ""
+                    st.info(f"{action} — {reason} ({confidence_label}){suffix}")
             else:
-                st.caption("No automated policy triggers for this dataset.")
+                st.caption("No database-level policy triggers are active right now.")
 
         action_cols = st.columns([1, 1, 1, 1])
         if action_cols[0].button("🔁 Simulate Access", key=f"simulate-{dataset_id}"):
@@ -772,37 +774,34 @@ with migrations_tab:
         trend_df = migration_df[["id", "minutes since last move", "migrations (24h)"]].set_index("id")
         st.area_chart(trend_df)
 
-        policy_rows: List[Dict[str, object]] = []
-        for record in files_payload:
-            if not isinstance(record, dict):
-                continue
-            dataset = record.get("id")
-            for policy in record.get("policy_triggers") or []:
-                if not isinstance(policy, dict):
-                    continue
-                policy_rows.append(
-                    {
-                        "dataset": dataset,
-                        "action": policy.get("action"),
-                        "target_tier": policy.get("target_tier"),
-                        "target_location": policy.get("target_location"),
-                        "reason": policy.get("reason"),
-                        "confidence": policy.get("confidence"),
-                    }
-                )
-
-        st.markdown("**Automated policy triggers**")
-        if policy_rows:
-            policy_df = pd.DataFrame(policy_rows)
+        st.markdown("**Database policy triggers**")
+        global_policies = global_policy_state.get("policy_triggers") or []
+        if global_policies:
+            policy_df = pd.DataFrame(global_policies)
+            display_cols = ["type", "action", "reason", "confidence", "metric"]
+            for col in list(policy_df.columns):
+                if col not in display_cols:
+                    display_cols.append(col)
             if "confidence" in policy_df.columns:
                 policy_df["confidence"] = policy_df["confidence"].map(
                     lambda v: f"{float(v) * 100:.1f}%" if v not in (None, "") else "—"
                 )
-            st.dataframe(policy_df, use_container_width=True, hide_index=True)
+            st.dataframe(policy_df[display_cols], use_container_width=True, hide_index=True)
         else:
-            st.caption("No active automated triggers right now.")
+            st.caption("No database-level policy triggers are active right now.")
 
         warning_msgs, info_msgs = summarise_alerts(df)
+        for alert in global_policy_state.get("alerts") or []:
+            if not isinstance(alert, dict):
+                continue
+            message = alert.get("message") or alert.get("reason") or "database alert"
+            severity = str(alert.get("severity") or "info").lower()
+            prefix = "⚠️ [DB]" if severity in {"critical", "warning"} else "ℹ️ [DB]"
+            formatted = f"{prefix} {message}"
+            if severity in {"critical", "warning"}:
+                warning_msgs.append(formatted)
+            else:
+                info_msgs.append(formatted)
         st.markdown("**Active alerts**")
         if warning_msgs:
             for msg in warning_msgs:

@@ -36,6 +36,7 @@ STREAM_API_BASE = os.getenv("STREAM_API", "http://stream-api:8001")
 REPLICA_ENDPOINTS = parse_replica_env(os.getenv("REPLICA_ENDPOINTS"))
 SIMULATION_ENABLED = os.getenv("ENABLE_SYNTHETIC_LOAD", "1").lower() not in {"0", "false"}
 SIMULATION_THROTTLE = float(os.getenv("SYNTHETIC_LOAD_INTERVAL", "0.75"))
+DATASET_POLICY_MODE = os.getenv("ENABLE_DATASET_POLICY_TRIGGERS", "0").lower() in {"1", "true", "yes"}
 SIZE_KB_PER_GB = 1024 * 1024
 
 ALERT_COST_THRESHOLD = float(os.getenv("ALERT_COST_THRESHOLD", "0.08"))
@@ -57,6 +58,12 @@ ALERT_WRITE_RATIO_THRESHOLD = float(os.getenv("ALERT_WRITE_RATIO_THRESHOLD", "0.
 ALERT_MOVE_FAILURE_THRESHOLD = float(os.getenv("ALERT_MOVE_FAILURE_THRESHOLD", "2"))
 ALERT_COOLING_EMA_THRESHOLD = float(os.getenv("ALERT_COOLING_EMA_THRESHOLD", "4"))
 
+GLOBAL_POLICY_DOC_ID = "global_policy_state"
+GLOBAL_POLICY_COST_THRESHOLD = float(os.getenv("GLOBAL_POLICY_COST_THRESHOLD", "6.0"))
+GLOBAL_POLICY_LATENCY_THRESHOLD = float(os.getenv("GLOBAL_POLICY_LATENCY_THRESHOLD", "220.0"))
+GLOBAL_POLICY_STREAM_THRESHOLD = float(os.getenv("GLOBAL_POLICY_STREAM_THRESHOLD", "120.0"))
+GLOBAL_POLICY_EGRESS_THRESHOLD = float(os.getenv("GLOBAL_POLICY_EGRESS_THRESHOLD", "250.0"))
+
 logger = logging.getLogger("netapp.api")
 
 app = FastAPI(title="NetApp Data-in-Motion API")
@@ -67,6 +74,7 @@ db = None
 coll_files = None
 coll_events = None
 coll_sync = None
+coll_global_state = None
 producer: Optional[KafkaProducer] = None
 predictor: TierPredictor = TierPredictor()
 consistency_mgr: Optional[ConsistencyManager] = None
@@ -915,6 +923,9 @@ def _evaluate_alerts(
             )
         )
 
+    if not DATASET_POLICY_MODE:
+        policies = []
+
     return {"alerts": alerts, "policies": policies}
 
 
@@ -997,6 +1008,289 @@ def _record_alert_events(
                     "reason": policy.get("reason"),
                 }
             )
+
+
+def _aggregate_database_metrics() -> Dict[str, Any]:
+    if coll_files is None:
+        return {
+            "dataset_count": 0,
+            "storage_gb_total": 0.0,
+            "estimated_monthly_cost": 0.0,
+            "avg_p95_latency": 0.0,
+            "max_p95_latency": 0.0,
+            "total_events_per_minute": 0.0,
+            "total_egress_cost_last_1hr": 0.0,
+            "cross_cloud_egress": 0.0,
+            "active_alerts": 0,
+            "tier_counts": {"hot": 0, "warm": 0, "cold": 0},
+        }
+
+    totals = {
+        "dataset_count": 0,
+        "storage_gb_total": 0.0,
+        "estimated_monthly_cost": 0.0,
+        "avg_p95_latency": 0.0,
+        "max_p95_latency": 0.0,
+        "total_events_per_minute": 0.0,
+        "total_egress_cost_last_1hr": 0.0,
+        "cross_cloud_egress": 0.0,
+        "active_alerts": 0,
+        "tier_counts": {"hot": 0, "warm": 0, "cold": 0},
+    }
+
+    latency_total = 0.0
+    latency_count = 0
+
+    cursor = coll_files.find(
+        {},
+        {
+            "storage_gb_estimate": 1,
+            "size_kb": 1,
+            "estimated_monthly_cost": 1,
+            "p95_latency_5min": 1,
+            "max_latency_10min": 1,
+            "events_per_minute": 1,
+            "egress_cost_last_1hr": 1,
+            "egress_to_s3_last_1hr": 1,
+            "egress_to_azure_last_1hr": 1,
+            "egress_to_gcs_last_1hr": 1,
+            "active_alerts": 1,
+            "current_tier": 1,
+        },
+    )
+
+    for doc in cursor:
+        totals["dataset_count"] += 1
+
+        storage_gb = 0.0
+        storage_val = doc.get("storage_gb_estimate")
+        try:
+            if storage_val is not None:
+                storage_gb = float(storage_val)
+        except (TypeError, ValueError):
+            storage_gb = 0.0
+        if storage_gb <= 0.0:
+            try:
+                storage_gb = float(doc.get("size_kb", 0.0)) / SIZE_KB_PER_GB
+            except (TypeError, ValueError):
+                storage_gb = 0.0
+        totals["storage_gb_total"] += max(storage_gb, 0.0)
+
+        try:
+            totals["estimated_monthly_cost"] += float(doc.get("estimated_monthly_cost", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            latency = float(doc.get("p95_latency_5min", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            latency = 0.0
+        if latency > 0.0:
+            latency_total += latency
+            latency_count += 1
+            totals["max_p95_latency"] = max(totals["max_p95_latency"], latency)
+
+        try:
+            totals["total_events_per_minute"] += float(doc.get("events_per_minute", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            totals["total_egress_cost_last_1hr"] += float(doc.get("egress_cost_last_1hr", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+        cross_cloud = 0.0
+        for key in ("egress_to_s3_last_1hr", "egress_to_azure_last_1hr", "egress_to_gcs_last_1hr"):
+            try:
+                cross_cloud += float(doc.get(key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+        totals["cross_cloud_egress"] += cross_cloud
+
+        if isinstance(doc.get("active_alerts"), list):
+            totals["active_alerts"] += len(doc["active_alerts"])
+
+        tier = str(doc.get("current_tier") or "").lower()
+        if tier in totals["tier_counts"]:
+            totals["tier_counts"][tier] += 1
+
+    if latency_count > 0:
+        totals["avg_p95_latency"] = latency_total / latency_count
+
+    totals["storage_gb_total"] = round(totals["storage_gb_total"], 4)
+    totals["estimated_monthly_cost"] = round(totals["estimated_monthly_cost"], 4)
+    totals["avg_p95_latency"] = round(totals["avg_p95_latency"], 2)
+    totals["max_p95_latency"] = round(totals["max_p95_latency"], 2)
+    totals["total_events_per_minute"] = round(totals["total_events_per_minute"], 2)
+    totals["total_egress_cost_last_1hr"] = round(totals["total_egress_cost_last_1hr"], 2)
+    totals["cross_cloud_egress"] = round(totals["cross_cloud_egress"], 2)
+
+    return totals
+
+
+def _refresh_global_policy_state() -> None:
+    if coll_global_state is None:
+        return
+
+    totals = _aggregate_database_metrics()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    existing = coll_global_state.find_one({"_id": GLOBAL_POLICY_DOC_ID}) or {}
+    existing_alerts = existing.get("alerts") or []
+    existing_policies = existing.get("policy_triggers") or []
+
+    prev_alert_map = {
+        _alert_signature(alert): alert for alert in existing_alerts if isinstance(alert, dict)
+    }
+    prev_policy_map = {
+        _policy_signature(policy): policy for policy in existing_policies if isinstance(policy, dict)
+    }
+
+    alerts: List[Dict[str, Any]] = []
+    policies: List[Dict[str, Any]] = []
+
+    def _carry_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
+        alert.setdefault("triggered_at", now_iso)
+        signature = _alert_signature(alert)
+        if signature in prev_alert_map:
+            alert.setdefault("triggered_at", prev_alert_map[signature].get("triggered_at", now_iso))
+        alert.setdefault("scope", "database")
+        return alert
+
+    def _carry_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+        policy.setdefault("triggered_at", now_iso)
+        policy.setdefault("scope", "database")
+        signature = _policy_signature(policy)
+        if signature in prev_policy_map:
+            existing_policy = prev_policy_map[signature]
+            policy.setdefault("triggered_at", existing_policy.get("triggered_at", now_iso))
+            if policy.get("confidence") in (None, 0.0):
+                policy["confidence"] = existing_policy.get("confidence")
+        return policy
+
+    total_cost = totals.get("estimated_monthly_cost", 0.0) or 0.0
+    if total_cost >= GLOBAL_POLICY_COST_THRESHOLD:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "global_cost",
+                    "severity": "warning",
+                    "reason": "database_cost_budget",
+                    "message": (
+                        f"Aggregate monthly cost ₹{total_cost:.2f} exceeds ₹{GLOBAL_POLICY_COST_THRESHOLD:.2f}"
+                    ),
+                    "metric": {"estimated_monthly_cost": total_cost},
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "global_cost",
+                    "action": "optimise_spend",
+                    "target": "database",
+                    "reason": "aggregate_cost_budget",
+                    "confidence": 0.82,
+                    "metric": {"estimated_monthly_cost": total_cost},
+                }
+            )
+        )
+
+    avg_latency = totals.get("avg_p95_latency", 0.0) or 0.0
+    if avg_latency >= GLOBAL_POLICY_LATENCY_THRESHOLD:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "global_latency",
+                    "severity": "critical",
+                    "reason": "p95_latency_breach",
+                    "message": (
+                        f"Average p95 latency {avg_latency:.1f} ms crosses {GLOBAL_POLICY_LATENCY_THRESHOLD:.1f} ms"
+                    ),
+                    "metric": {"avg_p95_latency": avg_latency},
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "global_latency",
+                    "action": "promote_hot_tier",
+                    "target": "database",
+                    "reason": "p95_latency_breach",
+                    "confidence": 0.86,
+                    "metric": {"avg_p95_latency": avg_latency},
+                }
+            )
+        )
+
+    throughput = totals.get("total_events_per_minute", 0.0) or 0.0
+    if throughput >= GLOBAL_POLICY_STREAM_THRESHOLD:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "global_streaming",
+                    "severity": "info",
+                    "reason": "kafka_throughput_spike",
+                    "message": (
+                        f"Kafka throughput {throughput:.1f}/min exceeds {GLOBAL_POLICY_STREAM_THRESHOLD:.1f}/min"
+                    ),
+                    "metric": {"total_events_per_minute": throughput},
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "global_streaming",
+                    "action": "scale_stream_consumers",
+                    "target": "database",
+                    "reason": "kafka_throughput_spike",
+                    "confidence": 0.8,
+                    "metric": {"total_events_per_minute": throughput},
+                }
+            )
+        )
+
+    cross_cloud = totals.get("cross_cloud_egress", 0.0) or 0.0
+    if cross_cloud >= GLOBAL_POLICY_EGRESS_THRESHOLD:
+        alerts.append(
+            _carry_alert(
+                {
+                    "type": "global_egress",
+                    "severity": "warning",
+                    "reason": "cross_cloud_traffic",
+                    "message": (
+                        f"Cross-cloud egress {cross_cloud:.1f} GB crosses {GLOBAL_POLICY_EGRESS_THRESHOLD:.1f} GB"
+                    ),
+                    "metric": {"cross_cloud_egress": cross_cloud},
+                }
+            )
+        )
+        policies.append(
+            _carry_policy(
+                {
+                    "type": "global_egress",
+                    "action": "rebalance_regions",
+                    "target": "database",
+                    "reason": "cross_cloud_traffic",
+                    "confidence": 0.78,
+                    "metric": {"cross_cloud_egress": cross_cloud},
+                }
+            )
+        )
+
+    state = {
+        "_id": GLOBAL_POLICY_DOC_ID,
+        "totals": totals,
+        "alerts": alerts,
+        "policy_triggers": policies,
+        "updated_at": now_iso,
+    }
+
+    coll_global_state.replace_one({"_id": GLOBAL_POLICY_DOC_ID}, state, upsert=True)
+
 
 def seed_from_disk():
     """Load /data/seeds/metadata.json into Mongo and ensure objects are in S3."""
@@ -1081,7 +1375,9 @@ def seed_from_disk():
                 existing_doc,
             )
             base_doc["active_alerts"] = evaluation.get("alerts", [])
-            base_doc["policy_triggers"] = evaluation.get("policies", [])
+            base_doc["policy_triggers"] = (
+                evaluation.get("policies", []) if DATASET_POLICY_MODE else []
+            )
             base_doc["last_alert_eval_ts"] = datetime.now(timezone.utc).isoformat()
         except Exception as exc:
             logger.debug("seed alert evaluation failed for %s: %s", m.get("id"), exc)
@@ -1665,6 +1961,10 @@ def _update_usage_metrics(file_id: str) -> None:
 
     if consistency_mgr is None:
         coll_files.update_one({"id": file_id}, {"$set": updates}, upsert=True)
+        try:
+            _refresh_global_policy_state()
+        except Exception as exc:
+            logger.debug("global policy refresh failed (no consistency mgr) for %s: %s", file_id, exc)
         return
 
     try:
@@ -1677,23 +1977,29 @@ def _update_usage_metrics(file_id: str) -> None:
         # fall back to a basic update but keep the API responsive
         coll_files.update_one({"id": file_id}, {"$set": updates}, upsert=True)
 
+    try:
+        _refresh_global_policy_state()
+    except Exception as exc:
+        logger.debug("global policy refresh failed for %s: %s", file_id, exc)
+
 # --------- lifecycle ----------
 @app.on_event("startup")
 def on_startup():
     """
     Robust startup with retries. Keep /health responsive even if deps are warming up.
     """
-    global mongo, db, coll_files, coll_events, coll_sync, producer, consistency_mgr
+    global mongo, db, coll_files, coll_events, coll_sync, coll_global_state, producer, consistency_mgr
 
     # 1) Mongo
     def _mongo():
-        global mongo, db, coll_files, coll_events, coll_sync
+        global mongo, db, coll_files, coll_events, coll_sync, coll_global_state
         mongo = MongoClient(MONGO_URL, serverSelectionTimeoutMS=2000)
         _ = mongo.admin.command("ping")
         db = mongo["netapp"]
         coll_files = db["files"]
         coll_events = db["events"]
         coll_sync = db["sync_queue"]
+        coll_global_state = db["global_state"]
     with_retry(_mongo, retries=10, backoff=0.5)
 
     # 1b) Initialize consistency manager once Mongo is ready
@@ -1760,6 +2066,11 @@ def on_startup():
     except Exception as exc:
         logger.debug("failed to start simulator: %s", exc)
 
+    try:
+        _refresh_global_policy_state()
+    except Exception as exc:
+        logger.debug("initial global policy refresh failed: %s", exc)
+
 
 # --------- shutdown ----------
 @app.on_event("shutdown")
@@ -1780,6 +2091,33 @@ def list_files():
     if coll_files is None:
         raise HTTPException(503, "db not ready")
     return list(coll_files.find({}, {"_id": 0}))
+
+
+@app.get("/policy/global")
+def global_policy():
+    if coll_global_state is None:
+        raise HTTPException(503, "db not ready")
+
+    try:
+        _refresh_global_policy_state()
+    except Exception:
+        pass
+
+    state = coll_global_state.find_one({"_id": GLOBAL_POLICY_DOC_ID}, {"_id": 0})
+    if not state:
+        totals = _aggregate_database_metrics()
+        return {
+            "totals": totals,
+            "policy_triggers": [],
+            "alerts": [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    state.setdefault("totals", _aggregate_database_metrics())
+    state.setdefault("policy_triggers", [])
+    state.setdefault("alerts", [])
+    return state
+
 
 @app.get("/policy/{file_id}")
 def policy(file_id: str):
