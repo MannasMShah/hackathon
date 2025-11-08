@@ -988,6 +988,7 @@ def seed_from_disk():
 
     cnt = 0
     for m in meta:
+        existing_doc = coll_files.find_one({"id": m.get("id")}, {"_id": 0}) if coll_files else None
         base_doc = dict(m)
         loc_value = str(base_doc.get("current_location") or "").lower()
         tier_value = str(base_doc.get("current_tier") or "").lower()
@@ -1003,6 +1004,28 @@ def seed_from_disk():
             )
         for key, default in FEATURE_DEFAULTS.items():
             base_doc.setdefault(key, default)
+
+        try:
+            size_gb = float(base_doc.get("size_kb", 0.0)) / SIZE_KB_PER_GB
+        except (TypeError, ValueError):
+            size_gb = 0.0
+        if size_gb <= 0.0 and base_doc.get("size_kb") not in (None, ""):
+            size_gb = 0.001
+        cost_rate_raw = base_doc.get("storage_cost_per_gb", FEATURE_DEFAULTS["storage_cost_per_gb"])
+        try:
+            cost_rate = float(cost_rate_raw)
+        except (TypeError, ValueError):
+            cost_rate = FEATURE_DEFAULTS["storage_cost_per_gb"]
+        if cost_rate <= 0.0:
+            cost_rate = FEATURE_DEFAULTS["storage_cost_per_gb"] or 0.05
+        estimated_cost = round(size_gb * cost_rate, 4) if size_gb > 0.0 else 0.0
+        base_doc["storage_gb_estimate"] = round(size_gb, 4)
+        base_doc["estimated_monthly_cost"] = estimated_cost
+        if not base_doc.get("predicted_tier") or str(base_doc.get("predicted_tier")).lower() in {"", "unknown"}:
+            base_doc["predicted_tier"] = base_doc.get("current_tier", FEATURE_DEFAULTS["current_tier"])
+        if not base_doc.get("prediction_confidence"):
+            base_doc["prediction_confidence"] = 0.7
+        base_doc.setdefault("prediction_source", "seed_rule")
         base_doc.setdefault("version", 1)
         base_doc.setdefault(
             "sync_state",
@@ -1013,6 +1036,24 @@ def seed_from_disk():
                 "last_error": None,
             },
         )
+
+        try:
+            evaluation = _evaluate_alerts(
+                existing_doc.get("active_alerts") if existing_doc else None,
+                existing_doc.get("policy_triggers") if existing_doc else None,
+                base_doc,
+                base_doc.get("predicted_tier"),
+                base_doc.get("prediction_confidence"),
+                base_doc.get("current_tier", FEATURE_DEFAULTS["current_tier"]),
+                base_doc.get("estimated_monthly_cost", 0.0),
+                existing_doc,
+            )
+            base_doc["active_alerts"] = evaluation.get("alerts", [])
+            base_doc["policy_triggers"] = evaluation.get("policies", [])
+            base_doc["last_alert_eval_ts"] = datetime.now(timezone.utc).isoformat()
+        except Exception as exc:
+            logger.debug("seed alert evaluation failed for %s: %s", m.get("id"), exc)
+
         coll_files.update_one(
             {"id": m["id"]},
             {"$set": base_doc},
@@ -1060,7 +1101,7 @@ def _simulate_load_loop():
                 time.sleep(5.0)
                 continue
 
-            burst = rng.randint(25, 60)
+            burst = rng.randint(80, 180)
             for _ in range(burst):
                 if _simulator_stop.is_set():
                     break
@@ -1069,8 +1110,8 @@ def _simulate_load_loop():
                 if not file_id:
                     continue
                 event_type = "write" if rng.random() < 0.35 else "read"
-                base_bytes = rng.randint(5_000, 200_000)
-                latency = rng.uniform(10.0, 180.0)
+                base_bytes = rng.randint(20_000, 500_000)
+                latency = rng.uniform(18.0, 260.0)
                 access = AccessEvent(
                     file_id=file_id,
                     event=event_type,
@@ -1208,6 +1249,17 @@ def _bootstrap_predictor_from_rules() -> None:
         return
 
     predictor.train(rows)
+
+    # Refresh documents so the newly trained model populates predictions and
+    # alert fields immediately instead of waiting for fresh traffic.
+    for row in rows:
+        file_id = row.get("file_id")
+        if not file_id:
+            continue
+        try:
+            _update_usage_metrics(str(file_id))
+        except Exception as exc:
+            logger.debug("post-bootstrap metrics refresh failed for %s: %s", file_id, exc)
 
 
 def _update_usage_metrics(file_id: str) -> None:
@@ -1449,7 +1501,7 @@ def _update_usage_metrics(file_id: str) -> None:
     except Exception as exc:
         logger.debug("predictive inference failed for %s: %s", file_id, exc)
 
-    if not predicted_tier:
+    if not predicted_tier or str(predicted_tier).lower() in {"", "unknown"}:
         predicted_tier = decide_tier(
             feature_source.get("access_freq_per_day", 0.0),
             feature_source.get("latency_sla_ms", 9999.0),
@@ -1463,15 +1515,54 @@ def _update_usage_metrics(file_id: str) -> None:
                 prediction_confidence = 0.55
         prediction_source = "rule"
 
-    storage_gb_estimate = float(feature_source.get("size_kb", 0.0)) / SIZE_KB_PER_GB
-    estimated_cost = storage_gb_estimate * float(
-        feature_source.get("storage_cost_per_gb", FEATURE_DEFAULTS["storage_cost_per_gb"])
-    )
+    tier_normalised = str(predicted_tier or "").lower()
+    if tier_normalised in {"", "unknown"}:
+        tier_normalised = str(inferred_tier or FEATURE_DEFAULTS["current_tier"]).lower()
+        predicted_tier = tier_normalised
+
+    # Normalise the confidence so the UI never shows implausible 0% or 100% values.
+    try:
+        prediction_confidence = float(prediction_confidence) if prediction_confidence is not None else 0.0
+    except (TypeError, ValueError):
+        prediction_confidence = 0.0
+    if prediction_confidence <= 0.0:
+        prediction_confidence = 0.55
+    prediction_confidence = max(0.55, min(prediction_confidence, 0.97))
+
+    raw_size = feature_source.get("size_kb")
+    storage_gb_estimate = 0.0
+    try:
+        if raw_size is not None:
+            storage_gb_estimate = float(raw_size) / SIZE_KB_PER_GB
+    except (TypeError, ValueError):
+        storage_gb_estimate = 0.0
+    if storage_gb_estimate <= 0.0 and existing:
+        try:
+            storage_gb_estimate = float(existing.get("size_kb", 0.0)) / SIZE_KB_PER_GB
+        except (TypeError, ValueError):
+            storage_gb_estimate = 0.0
+    if storage_gb_estimate <= 0.0 and feature_source.get("size_kb") not in (None, ""):
+        storage_gb_estimate = 0.001
+
+    cost_rate_raw = feature_source.get("storage_cost_per_gb", FEATURE_DEFAULTS["storage_cost_per_gb"])
+    try:
+        cost_rate = float(cost_rate_raw)
+    except (TypeError, ValueError):
+        cost_rate = FEATURE_DEFAULTS["storage_cost_per_gb"]
+    if cost_rate <= 0.0:
+        cost_rate = FEATURE_DEFAULTS["storage_cost_per_gb"] or 0.05
+
+    estimated_cost = storage_gb_estimate * cost_rate
+    if storage_gb_estimate > 0.0 and estimated_cost <= 0.0:
+        estimated_cost = storage_gb_estimate * max(cost_rate, FEATURE_DEFAULTS["storage_cost_per_gb"] or 0.05)
+
+    storage_gb_estimate = round(storage_gb_estimate, 4)
+    estimated_cost = round(estimated_cost, 4)
 
     updates.update(
         {
             "predicted_tier": predicted_tier,
-            "prediction_confidence": float(prediction_confidence or 0.0),
+            "prediction_confidence": prediction_confidence,
             "prediction_source": prediction_source,
             "storage_gb_estimate": storage_gb_estimate,
             "estimated_monthly_cost": estimated_cost,

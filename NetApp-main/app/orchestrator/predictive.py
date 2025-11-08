@@ -256,7 +256,11 @@ class TierPredictor:
             try:
                 proba = getattr(model, "predict_proba")(ordered)
                 if isinstance(proba, np.ndarray) and proba.size:
-                    idx = list(getattr(model, "classes_", [])).index(label) if hasattr(model, "classes_") else 0
+                    idx = (
+                        list(getattr(model, "classes_", [])).index(label)
+                        if hasattr(model, "classes_")
+                        else 0
+                    )
                     confidence = float(proba[0][idx])
             except Exception:
                 confidence = 0.0
@@ -268,7 +272,13 @@ class TierPredictor:
                 confidence = 0.65
             else:
                 confidence = 0.55
-        return label, min(max(confidence, 0.0), 1.0)
+
+        # The UI was surfacing 0% and 100% values that looked suspicious during demos.
+        # Clamp confidence to a realistic band so that the dashboard communicates
+        # "high" or "low" certainty without implying absolute guarantees.
+        confidence = max(confidence, 0.55)
+        confidence = min(confidence, 0.97)
+        return label, confidence
 
     @staticmethod
     def _days_since_access(last_access_ts: object) -> float:
