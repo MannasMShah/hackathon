@@ -1,1 +1,2 @@
-﻿Hello from file_003 (cold candidate)
+Synthetic seed content for file_003.txt
+Current tier hint: COLD
