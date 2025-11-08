@@ -12,6 +12,7 @@ import streamlit as st
 API = "http://api:8000"
 STREAM_API = os.getenv("STREAM_API", "http://stream-api:8001")
 SIZE_KB_PER_GB = 1024 * 1024
+TIER_TO_LOCATION = {"hot": "azure", "warm": "s3", "cold": "gcs"}
 
 
 st.set_page_config(page_title="NetApp Data-in-Motion", layout="wide")
@@ -288,6 +289,7 @@ with st.container(border=True):
             st.markdown("**Ongoing migrations (24h)**")
             st.metric("Recent moves", migrations_today)
             st.caption(f"Stream events seen: {int(stream_metrics.get('total_events', 0))}")
+        st.caption("Tier defaults: Azure = HOT, S3 = WARM, GCS = COLD. Confidence ≥95% triggers eligible bulk moves.")
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +384,50 @@ with datasets_tab:
             use_container_width=True,
             hide_index=True,
         )
+
+        high_confidence_moves: List[Tuple[str, str, str, float]] = []
+        for record in files_payload:
+            if not isinstance(record, dict):
+                continue
+            dataset_id = record.get("id")
+            tier = str(record.get("predicted_tier") or "").lower()
+            confidence = safe_float(record.get("prediction_confidence"))
+            if not dataset_id or not tier:
+                continue
+            target_location = TIER_TO_LOCATION.get(tier)
+            current_location = str(record.get("current_location") or "").lower()
+            if target_location and confidence >= 0.95 and current_location != target_location:
+                high_confidence_moves.append((dataset_id, tier, target_location, confidence))
+
+        bulk_cols = st.columns([1, 2, 2])
+        bulk_cols[0].metric("Ready to move", len(high_confidence_moves))
+        bulk_cols[1].markdown(
+            "High-confidence recommendations (≥95%) will promote or demote data to the tier's default cloud: "
+            "Azure → HOT, S3 → WARM, GCS → COLD."
+        )
+        if bulk_cols[2].button(
+            "⚡ Apply high-confidence moves",
+            disabled=not high_confidence_moves,
+        ):
+            successes = 0
+            failures: List[Tuple[str, Exception]] = []
+            with st.spinner("Applying predictive tier changes..."):
+                for dataset_id, tier, target_location, confidence in high_confidence_moves:
+                    try:
+                        response = requests.post(
+                            f"{API}/move",
+                            json={"file_id": dataset_id, "target": target_location},
+                            timeout=10,
+                        )
+                        response.raise_for_status()
+                        successes += 1
+                    except Exception as exc:
+                        failures.append((dataset_id, exc))
+            if successes:
+                st.success(f"Triggered {successes} predictive migration(s) with ≥95% confidence")
+                refresh_all_caches()
+            for dataset_id, exc in failures:
+                st.error(f"Failed to move {dataset_id}: {exc}")
 
         st.markdown("### Dataset drill-down")
         dataset_id = st.selectbox("Select dataset", options=filtered_df["id"].tolist())

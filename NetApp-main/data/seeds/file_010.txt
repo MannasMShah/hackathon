@@ -1,1 +1,2 @@
-Sample dataset 10 illustrating enriched telemetry, predictive features, and cross-cloud access patterns for the NetApp Data-in-Motion hackathon demo.
+Synthetic seed content for file_010.txt
+Current tier hint: WARM
