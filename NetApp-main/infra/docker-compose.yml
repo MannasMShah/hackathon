@@ -1,0 +1,102 @@
+services:
+  # Kafka-compatible broker without ZooKeeper
+  redpanda:
+    image: redpandadata/redpanda:v24.1.8
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: >
+      azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --loose
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite_data:/data
+
+
+  fakegcs:
+    image: fsouza/fake-gcs-server:latest
+    command: -scheme http -port 4443 -public-host localhost:4443
+    ports:
+      - "4443:4443"
+    volumes:
+      - fakegcs_data:/data
+
+  mongo:
+    image: mongo:6
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  api:
+    build:
+      context: ../app
+    command: uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
+    working_dir: /app
+    volumes:
+      - ../app:/app
+      - ../data:/data
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092         # <— changed
+      MONGO_URL: mongodb://mongo:27017
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio12345
+      S3_BUCKET: netapp-bucket
+      AZURITE_BLOB_URL: http://azurite:10000/devstoreaccount1
+      AZURITE_ACCOUNT: devstoreaccount1
+      AZURITE_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OU==
+      GCS_ENDPOINT: http://fakegcs:4443
+      GCS_BUCKET: netapp-gcs
+      TOPIC_ACCESS: access-events
+    depends_on:
+      - redpanda
+      - mongo
+      - minio
+      - azurite
+      - fakegcs
+    ports:
+      - "8000:8000"
+
+  ui:
+    image: python:3.11-slim
+    working_dir: /app
+    command: bash -lc "pip install streamlit requests pandas && streamlit run ui/dashboard.py --server.port 8501 --server.address 0.0.0.0"
+    volumes:
+      - ../app:/app
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+
+volumes:
+  minio_data:
+  azurite_data:
+  fakegcs_data:
+  mongo_data:

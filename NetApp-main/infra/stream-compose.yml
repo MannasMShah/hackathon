@@ -1,0 +1,55 @@
+﻿services:
+  stream-api:
+    image: python:3.11-slim
+    container_name: stream-api
+    working_dir: /app
+    volumes:
+      - ../api:/app/api:ro
+    command: bash -lc "pip install --no-cache-dir fastapi uvicorn requests && uvicorn api.stream_server:app --host 0.0.0.0 --port 8001"
+    ports:
+      - "8001:8001"
+    environment:
+      HOT_THRESHOLD: "20"
+      TEMP_ALERT: "80.0"
+
+  stream-consumer:
+    image: python:3.11-slim
+    container_name: stream-consumer
+    working_dir: /app
+    volumes:
+      - ../app/streaming/consumer:/app/consumer:ro
+    command: bash -lc "pip install --no-cache-dir kafka-python requests && python consumer/consumer.py"
+    environment:
+      KAFKA_BOOTSTRAP: "host.docker.internal:19092"
+      KAFKA_TOPIC: "sensor_stream"
+      STREAM_API: "http://stream-api:8001/stream/event"
+      Z_THRESH: "2.5"
+    depends_on:
+      - stream-api
+
+  stream-producer:
+    image: python:3.11-slim
+    container_name: stream-producer
+    working_dir: /app
+    volumes:
+      - ../app/streaming/producer:/app/producer:ro
+    command: bash -lc "pip install --no-cache-dir kafka-python && python producer/producer.py"
+    environment:
+      KAFKA_BOOTSTRAP: "host.docker.internal:19092"
+      KAFKA_TOPIC: "sensor_stream"
+      EVENT_DELAY_SECONDS: "1.0"
+    depends_on:
+      - stream-api
+
+  stream-ui:
+    image: python:3.11-slim
+    container_name: stream-ui
+    working_dir: /app
+    volumes:
+      - ../ui:/app/ui:ro
+    command: bash -lc "pip install --no-cache-dir streamlit pandas requests && streamlit run ui/stream_dashboard.py --server.port 8601 --server.address 0.0.0.0"
+    ports:
+      - "8601:8601"
+    environment:
+      STREAM_API_HOST: "stream-api"
+      STREAM_API_PORT: "8001"

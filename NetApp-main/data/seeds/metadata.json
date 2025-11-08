@@ -1,0 +1,5 @@
+﻿[
+  {"id":"file_001.txt","size_kb":2,"latency_sla_ms":20,"access_freq_per_day":150,"last_access_ts": "2025-11-08T08:00:00Z"},
+  {"id":"file_002.txt","size_kb":512,"latency_sla_ms":80,"access_freq_per_day":45,"last_access_ts": "2025-11-08T06:00:00Z"},
+  {"id":"file_003.txt","size_kb":2048,"latency_sla_ms":500,"access_freq_per_day":2,"last_access_ts": "2025-11-06T09:00:00Z"}
+]
