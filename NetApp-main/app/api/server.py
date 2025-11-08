@@ -1,9 +1,15 @@
-import os, json, time
+import json
+import logging
+import os
+import random
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import fmean
 from typing import Any, Dict, List, Optional, Union
 
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -25,7 +31,12 @@ from orchestrator.predictive import TierPredictor, auto_label_records
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "redpanda:9092")
 TOPIC_ACCESS = os.getenv("TOPIC_ACCESS", "access-events")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongo:27017")
+STREAM_API_BASE = os.getenv("STREAM_API", "http://stream-api:8001")
 REPLICA_ENDPOINTS = parse_replica_env(os.getenv("REPLICA_ENDPOINTS"))
+SIMULATION_ENABLED = os.getenv("ENABLE_SYNTHETIC_LOAD", "1").lower() not in {"0", "false"}
+SIMULATION_THROTTLE = float(os.getenv("SYNTHETIC_LOAD_INTERVAL", "2.5"))
+
+logger = logging.getLogger("netapp.api")
 
 app = FastAPI(title="NetApp Data-in-Motion API")
 
@@ -38,6 +49,9 @@ coll_sync = None
 producer: Optional[KafkaProducer] = None
 predictor: TierPredictor = TierPredictor()
 consistency_mgr: Optional[ConsistencyManager] = None
+_simulator_stop = threading.Event()
+_simulator_thread: Optional[threading.Thread] = None
+_simulator_event_counter = 0
 
 # --------- models ----------
 class AccessEvent(BaseModel):
@@ -57,6 +71,7 @@ class AccessEvent(BaseModel):
     failed_read: bool = False
     network_failure: bool = False
     success: bool = True
+    source: Optional[str] = "api"
 
 class MoveRequest(BaseModel):
     file_id: str
@@ -102,6 +117,14 @@ class TrainPredictivePayload(BaseModel):
     records: Optional[List[TrainingRecord]] = None
     auto_label: bool = True
 
+
+class SimulationBurst(BaseModel):
+    events: int = 500
+    file_ids: Optional[List[str]] = None
+    include_moves: bool = True
+    stream_events: bool = True
+    pace_ms: int = 0
+
 # --------- helpers ----------
 FEATURE_DEFAULTS: Dict[str, Any] = {
     "req_count_last_1min": 0.0,
@@ -137,6 +160,64 @@ LOCATION_TO_TIER = {
     "azure": "hot",
     "gcs": "cold",
 }
+
+
+def _stream_event_payload(file_id: str, ev: AccessEvent, counter: int) -> Dict[str, Any]:
+    base = abs(hash(file_id)) % 10_000
+    return {
+        "event_id": counter,
+        "device_id": base,
+        "temperature": float(ev.temperature if ev.temperature is not None else random.uniform(50.0, 90.0)),
+        "bytes": int((ev.bytes_read or 0) + (ev.bytes_written or 0)),
+        "timestamp": float(ev.ts or time.time()),
+    }
+
+
+def _post_stream_event(session: requests.Session, payload: Dict[str, Any]) -> None:
+    if not STREAM_API_BASE:
+        return
+    try:
+        session.post(f"{STREAM_API_BASE}/stream/event", json=payload, timeout=1.5)
+    except Exception:
+        # Keep simulation resilient even if the stream API is warming up.
+        pass
+
+
+def _build_stream_snapshot(limit: int = 240) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {
+        "throughput_per_min": 0.0,
+        "active_clients": 0,
+        "events": [],
+        "total_events": 0,
+    }
+    if coll_events is None:
+        return snapshot
+
+    now = time.time()
+    cursor = (
+        coll_events.find({"type": "access"}, {"_id": 0})
+        .sort("ts", -1)
+        .limit(limit)
+    )
+    events = list(cursor)
+    events.reverse()
+    for evt in events:
+        if isinstance(evt, dict) and "timestamp" not in evt and evt.get("ts") is not None:
+            try:
+                evt["timestamp"] = float(evt["ts"])
+            except (TypeError, ValueError):
+                continue
+    snapshot["events"] = events
+    snapshot["total_events"] = int(coll_events.count_documents({"type": "access"}))
+    if events:
+        recent = [evt for evt in events if now - float(evt.get("ts", 0.0) or 0.0) <= 60.0]
+        if recent:
+            oldest = min(float(evt.get("ts", now)) for evt in recent)
+            window = max(now - oldest, 1.0)
+            snapshot["throughput_per_min"] = float(len(recent)) * 60.0 / window
+        clients = {evt.get("client_id") for evt in events if evt.get("client_id")}
+        snapshot["active_clients"] = len(clients)
+    return snapshot
 
 
 def seed_from_disk():
@@ -194,6 +275,112 @@ def seed_from_disk():
                 pass
         cnt += 1
     return {"seeded": cnt, "ok": True}
+
+
+def _simulate_load_loop():
+    global _simulator_event_counter
+    if coll_files is None:
+        return
+
+    session = requests.Session()
+    rng = random.Random()
+    backoff = 1.0
+    while not _simulator_stop.is_set():
+        try:
+            files = list(
+                coll_files.find(
+                    {},
+                    {
+                        "_id": 0,
+                        "id": 1,
+                        "size_kb": 1,
+                        "cloud_region": 1,
+                        "current_location": 1,
+                        "current_tier": 1,
+                        "storage_cost_per_gb": 1,
+                    },
+                )
+            )
+            if not files:
+                time.sleep(5.0)
+                continue
+
+            burst = rng.randint(25, 60)
+            for _ in range(burst):
+                if _simulator_stop.is_set():
+                    break
+                record = rng.choice(files)
+                file_id = record.get("id")
+                if not file_id:
+                    continue
+                event_type = "write" if rng.random() < 0.35 else "read"
+                base_bytes = rng.randint(5_000, 200_000)
+                latency = rng.uniform(10.0, 180.0)
+                access = AccessEvent(
+                    file_id=file_id,
+                    event=event_type,
+                    ts=time.time(),
+                    client_id=f"svc-{rng.randint(1, 200)}",
+                    bytes_read=base_bytes if event_type == "read" else 0,
+                    bytes_written=base_bytes if event_type == "write" else 0,
+                    latency_ms=latency,
+                    temperature=rng.uniform(45.0, 95.0),
+                    high_temp_alert=rng.random() < 0.05,
+                    egress_cost=rng.uniform(0.0, 0.75),
+                    storage_cost_per_gb=record.get("storage_cost_per_gb", 0.05),
+                    cloud_region=record.get("cloud_region", "us-east-1"),
+                    sync_conflict=rng.random() < 0.02,
+                    failed_read=rng.random() < 0.01,
+                    network_failure=False,
+                    success=True,
+                    source="synthetic",
+                )
+                try:
+                    ingest_event(access)
+                except HTTPException:
+                    pass
+                _simulator_event_counter += 1
+                payload = _stream_event_payload(file_id, access, _simulator_event_counter)
+                if SIMULATION_ENABLED:
+                    _post_stream_event(session, payload)
+                if SIMULATION_THROTTLE > 0:
+                    time.sleep(SIMULATION_THROTTLE / max(burst, 1))
+
+            if rng.random() < 0.25:
+                record = rng.choice(files)
+                file_id = record.get("id")
+                if file_id:
+                    targets = [loc for loc in LOCATION_TO_TIER.keys() if loc != record.get("current_location")]
+                    if targets:
+                        try:
+                            move(MoveRequest(file_id=file_id, target=rng.choice(targets)))
+                        except HTTPException:
+                            pass
+
+            backoff = 1.0
+        except Exception as exc:
+            logger.debug("synthetic load loop error: %s", exc)
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+
+def _start_simulator() -> None:
+    global _simulator_thread
+    if not SIMULATION_ENABLED:
+        return
+    if _simulator_thread is not None and _simulator_thread.is_alive():
+        return
+    _simulator_stop.clear()
+    _simulator_thread = threading.Thread(target=_simulate_load_loop, name="synthetic-load", daemon=True)
+    _simulator_thread.start()
+
+
+def _stop_simulator() -> None:
+    global _simulator_thread
+    _simulator_stop.set()
+    if _simulator_thread and _simulator_thread.is_alive():
+        _simulator_thread.join(timeout=2.0)
+    _simulator_thread = None
 
 
 def _prepare_training_rows(payload: "TrainPredictivePayload"):
@@ -532,6 +719,22 @@ def on_startup():
     except Exception:
         producer = None  # allow API to run even without producer
 
+    # 6) Begin synthetic streaming if enabled so dashboards have live data.
+    try:
+        _start_simulator()
+    except Exception as exc:
+        logger.debug("failed to start simulator: %s", exc)
+
+
+# --------- shutdown ----------
+@app.on_event("shutdown")
+def on_shutdown():
+    try:
+        _stop_simulator()
+    except Exception as exc:
+        logger.debug("failed to stop simulator cleanly: %s", exc)
+
+
 # --------- endpoints ----------
 @app.get("/health")
 def health():
@@ -566,6 +769,18 @@ def policy(file_id: str):
         "confidence": confidence,
         "model_type": getattr(predictor, "model_type", "unknown"),
     }
+
+
+@app.get("/streaming/metrics")
+def streaming_metrics(limit: int = 240):
+    if coll_events is None:
+        raise HTTPException(503, "db not ready")
+    snapshot = _build_stream_snapshot(limit)
+    snapshot["producer_ready"] = producer is not None
+    snapshot["kafka_bootstrap"] = KAFKA_BOOTSTRAP
+    snapshot["topic"] = TOPIC_ACCESS
+    snapshot.setdefault("active_devices", snapshot.get("active_clients", 0))
+    return snapshot
 
 
 @app.post("/predictive/train")
@@ -769,6 +984,87 @@ def seed():
     if coll_files is None:
         raise HTTPException(503, "db not ready")
     return seed_from_disk()
+
+
+@app.post("/simulate/burst")
+def simulate_burst(payload: SimulationBurst):
+    if coll_files is None:
+        raise HTTPException(503, "db not ready")
+
+    query: Dict[str, Any] = {}
+    if payload.file_ids:
+        query["id"] = {"$in": payload.file_ids}
+    candidates = list(
+        coll_files.find(
+            query,
+            {
+                "_id": 0,
+                "id": 1,
+                "cloud_region": 1,
+                "current_location": 1,
+                "storage_cost_per_gb": 1,
+            },
+        )
+    )
+    if not candidates:
+        raise HTTPException(404, "no files available for simulation")
+
+    rng = random.Random()
+    produced = 0
+    migrations = 0
+    session = requests.Session() if payload.stream_events else None
+    global _simulator_event_counter
+
+    for _ in range(max(0, payload.events)):
+        record = rng.choice(candidates)
+        file_id = record["id"]
+        event_type = "write" if rng.random() < 0.3 else "read"
+        base_bytes = rng.randint(5_000, 500_000)
+        event = AccessEvent(
+            file_id=file_id,
+            event=event_type,
+            ts=time.time(),
+            client_id=f"burst-{rng.randint(1, 400)}",
+            bytes_read=base_bytes if event_type == "read" else 0,
+            bytes_written=base_bytes if event_type == "write" else 0,
+            latency_ms=rng.uniform(12.0, 220.0),
+            temperature=rng.uniform(50.0, 98.0),
+            high_temp_alert=rng.random() < 0.08,
+            egress_cost=rng.uniform(0.0, 1.0),
+            storage_cost_per_gb=record.get("storage_cost_per_gb", 0.05),
+            cloud_region=record.get("cloud_region", "us-east-1"),
+            sync_conflict=rng.random() < 0.03,
+            failed_read=rng.random() < 0.015,
+            network_failure=False,
+            success=True,
+            source="burst",
+        )
+        try:
+            ingest_event(event)
+        except HTTPException:
+            pass
+        produced += 1
+        _simulator_event_counter += 1
+        if payload.stream_events and session is not None:
+            _post_stream_event(session, _stream_event_payload(file_id, event, _simulator_event_counter))
+
+        if payload.include_moves and rng.random() < 0.1:
+            targets = [loc for loc in LOCATION_TO_TIER.keys() if loc != record.get("current_location")]
+            if targets:
+                try:
+                    move(MoveRequest(file_id=file_id, target=rng.choice(targets)))
+                    migrations += 1
+                except HTTPException:
+                    pass
+
+        if payload.pace_ms > 0:
+            time.sleep(payload.pace_ms / 1000.0)
+
+    return {
+        "events_generated": produced,
+        "migrations_triggered": migrations,
+        "stream_enqueued": bool(payload.stream_events),
+    }
 
 import hashlib
 def _sha(b: bytes) -> str:

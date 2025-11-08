@@ -16,6 +16,7 @@ SIZE_KB_PER_GB = 1024 * 1024
 
 st.set_page_config(page_title="NetApp Data-in-Motion", layout="wide")
 st.title("📊 NetApp Data-in-Motion — Mission Control")
+st.markdown("<meta http-equiv='refresh' content='15'>", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=5.0)
@@ -56,17 +57,29 @@ def fetch_stream_metrics(limit: int = 240) -> Dict[str, object]:
         "active_devices": 0,
         "events": [],
         "total_events": 0,
+        "producer_ready": False,
+        "stream_api_online": False,
     }
 
     try:
-        health = requests.get(f"{STREAM_API}/health", timeout=3)
-        health.raise_for_status()
-        payload = health.json()
+        snapshot = requests.get(
+            f"{API}/streaming/metrics",
+            params={"limit": limit},
+            timeout=5,
+        )
+        snapshot.raise_for_status()
+        payload = snapshot.json()
         if isinstance(payload, dict):
-            metrics["total_events"] = int(payload.get("events", 0) or 0)
-        metrics["reachable"] = True
+            metrics["throughput_per_min"] = float(payload.get("throughput_per_min", 0.0) or 0.0)
+            metrics["active_devices"] = int(payload.get("active_devices", 0) or 0)
+            metrics["events"] = payload.get("events", []) or []
+            metrics["total_events"] = int(payload.get("total_events", metrics["total_events"]) or 0)
+            metrics["producer_ready"] = bool(payload.get("producer_ready"))
+            metrics["kafka_bootstrap"] = payload.get("kafka_bootstrap")
+            metrics["topic"] = payload.get("topic")
+            metrics["reachable"] = True
     except Exception:
-        return metrics
+        pass
 
     try:
         resp = requests.get(
@@ -87,6 +100,8 @@ def fetch_stream_metrics(limit: int = 240) -> Dict[str, object]:
                 window = max(now - oldest, 1.0)
                 metrics["throughput_per_min"] = float(len(recent)) * 60.0 / window
             metrics["active_devices"] = len({evt.get("device_id") for evt in events if isinstance(evt, dict)})
+            metrics["reachable"] = True
+            metrics["stream_api_online"] = True
     except Exception:
         pass
 
@@ -396,13 +411,19 @@ with streaming_tab:
     throughput = float(stream_metrics.get("throughput_per_min", 0.0))
     active_devices = int(stream_metrics.get("active_devices", 0))
     total_events = int(stream_metrics.get("total_events", 0))
-    status_label = "Online" if stream_metrics.get("reachable") else "Offline"
+    status_label = "Online" if stream_metrics.get("stream_api_online") else "Offline"
 
-    metrics_cols = st.columns(4)
+    metrics_cols = st.columns(5)
     metrics_cols[0].metric("Kafka throughput", f"{throughput:.1f} msg/min")
     metrics_cols[1].metric("Active devices", active_devices)
     metrics_cols[2].metric("Stream events", total_events)
-    metrics_cols[3].metric("Stream API", status_label)
+    producer_status = "Ready" if stream_metrics.get("producer_ready") else "Offline"
+    metrics_cols[3].metric("Producer", producer_status)
+    metrics_cols[4].metric("Stream API", status_label)
+    if stream_metrics.get("kafka_bootstrap"):
+        st.caption(
+            f"Kafka bootstrap: `{stream_metrics.get('kafka_bootstrap')}` · Topic: `{stream_metrics.get('topic', 'access-events')}`"
+        )
 
     events = stream_metrics.get("events", []) if stream_metrics else []
     if events:
