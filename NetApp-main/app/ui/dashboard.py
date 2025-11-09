@@ -305,6 +305,25 @@ if not df.empty:
     if len(numeric_cols) > 0:
         df.loc[:, numeric_cols] = df.loc[:, numeric_cols].fillna(0)
 
+    # Ensure downstream aggregations always have the expected columns even if
+    # the API omits newer telemetry fields for certain records.
+    for latency_col in ["p95_latency_5min", "avg_latency_1min", "max_latency_10min"]:
+        if latency_col not in df.columns:
+            df[latency_col] = 0.0
+
+    for cost_col in ["storage_cost_per_gb", "egress_cost_last_1hr"]:
+        if cost_col not in df.columns:
+            df[cost_col] = 0.0
+
+    if "size_kb" not in df.columns:
+        df["size_kb"] = 0.0
+
+    if "cloud_region" not in df.columns:
+        df["cloud_region"] = "unknown"
+
+    if "current_tier" not in df.columns:
+        df["current_tier"] = "unknown"
+
 
 # ---------------------------------------------------------------------------
 # Global overview
