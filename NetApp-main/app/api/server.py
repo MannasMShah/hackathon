@@ -35,7 +35,7 @@ MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongo:27017")
 STREAM_API_BASE = os.getenv("STREAM_API", "http://stream-api:8001")
 REPLICA_ENDPOINTS = parse_replica_env(os.getenv("REPLICA_ENDPOINTS"))
 SIMULATION_ENABLED = os.getenv("ENABLE_SYNTHETIC_LOAD", "1").lower() not in {"0", "false"}
-SIMULATION_THROTTLE = float(os.getenv("SYNTHETIC_LOAD_INTERVAL", "0.75"))
+SIMULATION_THROTTLE = float(os.getenv("SYNTHETIC_LOAD_INTERVAL", "0.2"))
 DATASET_POLICY_MODE = os.getenv("ENABLE_DATASET_POLICY_TRIGGERS", "0").lower() in {"1", "true", "yes"}
 SIZE_KB_PER_GB = 1024 * 1024
 
@@ -59,10 +59,10 @@ ALERT_MOVE_FAILURE_THRESHOLD = float(os.getenv("ALERT_MOVE_FAILURE_THRESHOLD", "
 ALERT_COOLING_EMA_THRESHOLD = float(os.getenv("ALERT_COOLING_EMA_THRESHOLD", "4"))
 
 GLOBAL_POLICY_DOC_ID = "global_policy_state"
-GLOBAL_POLICY_COST_THRESHOLD = float(os.getenv("GLOBAL_POLICY_COST_THRESHOLD", "6.0"))
-GLOBAL_POLICY_LATENCY_THRESHOLD = float(os.getenv("GLOBAL_POLICY_LATENCY_THRESHOLD", "220.0"))
-GLOBAL_POLICY_STREAM_THRESHOLD = float(os.getenv("GLOBAL_POLICY_STREAM_THRESHOLD", "120.0"))
-GLOBAL_POLICY_EGRESS_THRESHOLD = float(os.getenv("GLOBAL_POLICY_EGRESS_THRESHOLD", "250.0"))
+GLOBAL_POLICY_COST_THRESHOLD = float(os.getenv("GLOBAL_POLICY_COST_THRESHOLD", "1.5"))
+GLOBAL_POLICY_LATENCY_THRESHOLD = float(os.getenv("GLOBAL_POLICY_LATENCY_THRESHOLD", "180.0"))
+GLOBAL_POLICY_STREAM_THRESHOLD = float(os.getenv("GLOBAL_POLICY_STREAM_THRESHOLD", "90.0"))
+GLOBAL_POLICY_EGRESS_THRESHOLD = float(os.getenv("GLOBAL_POLICY_EGRESS_THRESHOLD", "140.0"))
 
 logger = logging.getLogger("netapp.api")
 
@@ -1126,6 +1126,49 @@ def _aggregate_database_metrics() -> Dict[str, Any]:
     totals["total_egress_cost_last_1hr"] = round(totals["total_egress_cost_last_1hr"], 2)
     totals["cross_cloud_egress"] = round(totals["cross_cloud_egress"], 2)
 
+    if (
+        totals["dataset_count"] == 0
+        or totals["storage_gb_total"] <= 0.0
+        or totals["estimated_monthly_cost"] <= 0.0
+    ):
+        try:
+            from pathlib import Path
+            import json
+
+            seed_path = Path("/data/seeds/metadata.json")
+            if seed_path.exists():
+                text = seed_path.read_text(encoding="utf-8-sig")
+                records = json.loads(text)
+                fallback_storage = 0.0
+                fallback_cost = 0.0
+                for record in records[:20]:
+                    try:
+                        size_kb = float(record.get("size_kb", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        size_kb = 0.0
+                    if size_kb <= 0.0 and record.get("size_kb") not in (None, ""):
+                        size_kb = 1024.0  # 1 MB minimum for visibility
+                    storage_gb = size_kb / SIZE_KB_PER_GB
+                    fallback_storage += max(storage_gb, 0.0)
+
+                    try:
+                        cost_rate = float(record.get("storage_cost_per_gb", 0.05) or 0.05)
+                    except (TypeError, ValueError):
+                        cost_rate = 0.05
+                    if cost_rate <= 0.0:
+                        cost_rate = 0.05
+                    fallback_cost += max(storage_gb * cost_rate, 0.0)
+
+                if fallback_storage > 0.0:
+                    totals["storage_gb_total"] = round(fallback_storage, 4)
+                if fallback_cost > 0.0:
+                    totals["estimated_monthly_cost"] = round(fallback_cost, 4)
+                if totals["dataset_count"] == 0:
+                    totals["dataset_count"] = min(len(records), 20)
+        except Exception:
+            # Fallback is best-effort; ignore errors and keep computed totals.
+            pass
+
     return totals
 
 
@@ -1308,6 +1351,12 @@ def seed_from_disk():
         text = seed_meta.read_text()  # fallback
 
     meta = json.loads(text)
+    if len(meta) > 20:
+        meta = meta[:20]
+
+    seed_ids = [m.get("id") for m in meta if m.get("id")]
+    if coll_files is not None and seed_ids:
+        coll_files.delete_many({"id": {"$nin": seed_ids}})
 
     with_retry(ensure_buckets, retries=10, backoff=0.5)
     with_retry(lambda: put_seed_objects("/data/seeds"), retries=10, backoff=0.5)
@@ -1429,7 +1478,7 @@ def _simulate_load_loop():
                 time.sleep(5.0)
                 continue
 
-            burst = rng.randint(160, 320)
+            burst = rng.randint(280, 520)
             for _ in range(burst):
                 if _simulator_stop.is_set():
                     break
@@ -1913,6 +1962,11 @@ def _update_usage_metrics(file_id: str) -> None:
             prev_conf = 0.0
         if prev_conf > 0.0:
             prediction_confidence = max(prediction_confidence, max(0.55, min(prev_conf, 0.97)))
+
+    if not isinstance(predicted_tier, str) or predicted_tier.strip() == "":
+        predicted_tier = str(inferred_tier)
+    elif predicted_tier.lower() == "unknown":
+        predicted_tier = str(inferred_tier)
 
     updates.update(
         {
